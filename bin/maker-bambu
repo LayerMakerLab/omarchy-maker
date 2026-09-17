@@ -14,6 +14,7 @@ works while the printer stays signed in to Bambu's cloud; this tool only watches
     maker-bambu print              start BAMBU_FILE from the printer's storage (needs BAMBU_CONFIRM=print)
     maker-bambu snapshot FILE.jpg  one chamber camera frame (P1 and A1; LAN Mode Liveview on)
     maker-bambu light on|off       chamber light
+    maker-bambu gcode "G90\nG1 Z150" G-code lines to an idle printer (bp brings the bed into the camera's view)
 
 check and watch take everything from the environment, never from argv (other users can read argv):
     BAMBU_HOST, BAMBU_SERIAL, BAMBU_ACCESS_CODE, BAMBU_FINGERPRINT
@@ -474,6 +475,28 @@ def cmd_light(mode):
     out({"light": mode, "reply": reply})
 
 
+def cmd_gcode(text):
+    """Send G-code lines to an idle printer. bp uses it to bring the bed up after a print, where the
+    camera can see the plate; the printer answers the same way it answers Bambu Studio's LAN mode."""
+    host, serial, code, fp = env_printer()
+    param = text.replace("\\n", "\n").strip() + "\n"
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+    publish(sock, "device/%s/request" % serial, {"print": {"sequence_id": "4", "command": "gcode_line", "param": param}})
+    reply = None
+    for msg in session_messages(sock, serial, 6):
+        p = msg.get("print") if isinstance(msg.get("print"), dict) else None
+        if p and p.get("command") == "gcode_line":
+            reply = p.get("result")
+            break
+    sock.close()
+    out({"gcode": param.strip().split("\n"), "reply": reply})
+
+
 def cmd_watch():
     host, serial, code, fp = env_printer()
     backoff = 2
@@ -544,6 +567,8 @@ if __name__ == "__main__":
         cmd_unload()
     elif args[0] == "print":
         cmd_print()
+    elif args[0] == "gcode" and len(args) == 2:
+        cmd_gcode(args[1])
     elif args[0] == "light" and len(args) == 2 and args[1] in ("on", "off"):
         cmd_light(args[1])
     elif args[0] == "snapshot" and len(args) == 2:

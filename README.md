@@ -53,6 +53,18 @@ steps and the evidence.
 
 ## Install
 
+One line, from the latest release:
+
+```bash
+curl -fsSL https://github.com/LayerMakerLab/omarchy-maker/releases/latest/download/install-omarchy-maker.sh | bash
+```
+
+It downloads the release, checks it against the published checksum, unpacks it into
+`~/.local/share/omarchy-maker/checkout` and runs the installer there, which asks which apps to download.
+Put `-s -- --apps orca,bambu,openscad` after `bash` to say it up front. The same line again updates.
+
+Or from a clone, if you want to follow the code:
+
 ```bash
 git clone https://github.com/LayerMakerLab/omarchy-maker ~/.local/share/omarchy-maker/checkout
 cd ~/.local/share/omarchy-maker/checkout

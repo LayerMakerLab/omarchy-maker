@@ -42,4 +42,14 @@ else
   echo "cut-release: tagged v$version"
 fi
 echo "cut-release: public -> $(git rev-parse --short public) (omarchy-maker $version, tree of $src)"
-echo "push with: git push origin public:main --follow-tags"
+
+# The release assets: the tree as one archive, the one-line installer, and their checksums. Asset
+# names carry no version so that .../releases/latest/download/<name> always points at the newest.
+rm -rf dist && mkdir -p dist
+git archive public --format=tar.gz --prefix="omarchy-maker-$version/" -o dist/omarchy-maker.tar.gz
+git show public:install-omarchy-maker.sh > dist/install-omarchy-maker.sh && chmod +x dist/install-omarchy-maker.sh
+if command -v sha256sum >/dev/null; then (cd dist && sha256sum omarchy-maker.tar.gz install-omarchy-maker.sh > SHA256SUMS)
+else (cd dist && shasum -a 256 omarchy-maker.tar.gz install-omarchy-maker.sh > SHA256SUMS); fi
+echo "cut-release: assets in dist/ ($(du -k dist/omarchy-maker.tar.gz | cut -f1) KB archive)"
+echo "publish with: git push origin public:main --follow-tags"
+echo "         and: gh release create v$version dist/omarchy-maker.tar.gz dist/install-omarchy-maker.sh dist/SHA256SUMS --title 'omarchy-maker $version' --notes-file <notes>"

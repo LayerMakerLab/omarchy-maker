@@ -1,3 +1,4 @@
 .maker/
 *.AppImage
 squashfs-root/
+dist/

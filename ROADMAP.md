@@ -134,7 +134,7 @@
 ## 1.0
 - [ ] screenshots (in progress 2026-09-17, taken on the laptop through its own Claude session)
 - [ ] a short demo recording of the two keys: Ctrl+Alt+O, Ctrl+Alt+Space, a model in, a test-print prep, the print window
-- [ ] the public repository: github.com/LayerMakerLab/omarchy-maker (name free, checked 2026-09-17; waits for Christian's GO).
+- [x] the public repository: github.com/LayerMakerLab/omarchy-maker (published 2026-09-17, v0.2.0, on Christian's GO).
       `main` is the working line; what ships is the `public` branch, one commit per release from `tools/cut-release.sh`,
       which refuses to cut anything with a private address, serial or key in it
 - [ ] the wizard kit on MakerWorld and Printables, pointing back here

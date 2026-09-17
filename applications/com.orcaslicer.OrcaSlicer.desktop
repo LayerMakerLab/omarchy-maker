@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=OrcaSlicer
+GenericName=3D Printing Software
+Comment=Slice 3D models for printing (omarchy-maker launcher)
+Icon=@ICON@
+Exec=@BIN@/maker-run orca %F
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=model/stl;model/3mf;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;application/x-amf;model/step;
+Keywords=3D;Printing;Slicer;slice;3D;printer;convert;gcode;stl;obj;amf;SLA
+StartupNotify=false
+StartupWMClass=orca-slicer
+X-OmarchyMaker=1

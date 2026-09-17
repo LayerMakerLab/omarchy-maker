@@ -1,0 +1,66 @@
+#!/bin/bash
+# maker-run — start a maker app with the omarchy-maker fixes applied.
+#   maker-run orca     [files...]
+#   maker-run bambu    [files...]
+#   maker-run openscad [files...]
+# Prefers the app installed by `maker install`; falls back to a system package.
+set -uo pipefail
+
+app=${1:-}
+[ -n "$app" ] || { echo "usage: maker-run orca|bambu|openscad [files...]" >&2; exit 2; }
+shift
+
+MAKER_HOME=${MAKER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-maker}
+
+# The official AppImages are built on Ubuntu and ask about the system certificate store on every
+# launch when it is not where Ubuntu keeps it. Arch keeps the bundle here.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+  export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+fi
+
+case "$app" in
+  orca)     apprun="$MAKER_HOME/apps/orca/current/AppRun";     system=(orca-slicer /opt/orca-slicer/bin/orca-slicer) ;;
+  bambu)    apprun="$MAKER_HOME/apps/bambu/current/AppRun";    system=(bambu-studio /opt/bambu-studio/bin/bambu-studio) ;;
+  openscad) apprun="$MAKER_HOME/apps/openscad/current/AppRun"; system=(openscad /usr/bin/openscad) ;;
+  *) echo "maker-run: unknown app '$app' (orca, bambu, openscad)" >&2; exit 2 ;;
+esac
+
+# OpenSCAD's AppImage carries its own Qt without a Wayland plugin, so with Omarchy's QT_QPA_PLATFORM=wayland;xcb it
+# hunts for the plugin, complains, and lands on XWayland anyway. Send it there directly, and scale it the way Omarchy
+# scales GTK apps on XWayland (force_zero_scaling: the app has to scale itself; GDK_SCALE carries the factor).
+if [ "$app" = openscad ] && [ -x "$apprun" ]; then
+  export QT_QPA_PLATFORM=xcb
+  [ -n "${GDK_SCALE:-}" ] && export QT_SCALE_FACTOR="${QT_SCALE_FACTOR:-$GDK_SCALE}"
+  # An xcb Qt app aborts without DISPLAY. The desktop sets it; a shell reached over ssh or a script often does
+  # not, and systemd-run --scope hands the app the caller's environment, so find the XWayland socket ourselves.
+  if [ -z "${DISPLAY:-}" ]; then
+    for sock in /tmp/.X11-unix/X[0-9]*; do
+      [ -S "$sock" ] || continue
+      export DISPLAY=":${sock##*/X}"; break
+    done
+  fi
+fi
+
+# A slicer holds a lot of memory (a 500k-triangle model, the sliced G-code) and on a laptop with zram swap the kernel
+# pushed 566 MB of a running Orca out (vm.swappiness 150), which shows up as stutter when a model is rotated after a
+# pause. Its own scope keeps it in RAM and gives it three times the CPU share when Codex, Samba and friends compete.
+launch() {
+  if [ "$app" != openscad ] && command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --scope --quiet --collect -p MemorySwapMax=0 -- /bin/true 2>/dev/null; then
+    exec systemd-run --user --scope --quiet --collect --unit "maker-$app-$$" -p MemorySwapMax=0 -p CPUWeight=300 -- "$@"
+  fi
+  exec "$@"
+}
+
+if [ -x "$apprun" ]; then
+  launch "$apprun" "$@"
+fi
+for candidate in "${system[@]}"; do
+  resolved=$(command -v "$candidate" 2>/dev/null) || continue
+  launch "$resolved" "$@"
+done
+
+msg="$app is not installed. Run: maker install $app"
+echo "maker-run: $msg" >&2
+command -v omarchy-notification-send >/dev/null 2>&1 && omarchy-notification-send -u normal "omarchy-maker" "$msg"
+exit 127

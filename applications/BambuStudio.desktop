@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Bambu Studio
+GenericName=3D Printing Software
+Comment=Slice 3D models for Bambu Lab printers (omarchy-maker launcher)
+Icon=@ICON@
+Exec=@BIN@/maker-run bambu %U
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=model/stl;model/3mf;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;application/x-amf;x-scheme-handler/bambustudio;x-scheme-handler/bambustudioopen;
+Keywords=3D;Printing;Slicer;Bambu;MakerWorld;stl;3mf
+StartupNotify=false
+StartupWMClass=BambuStudio
+X-OmarchyMaker=1

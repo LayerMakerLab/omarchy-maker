@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""maker-blender: the mesh work a slicer cannot do, through Blender headless (standard library plus blender).
+
+    maker-blender render MODEL.stl                   a picture of it, to look at before anything is printed
+                                                     (--angle iso|front|side|back)
+    maker-blender check MODEL.stl                    triangles, size, open and non-manifold edges, loose parts
+    maker-blender simplify MODEL.stl --to 500000     fewer triangles, by collapse (never a voxel remesh)
+    maker-blender split MODEL.stl --at 21,95         cut into parts that slot together: the part above each cut
+                                                     slips over a spigot on the part below, so it lines up on
+                                                     its own and the seam has somewhere to hide
+    maker-blender free MODEL.stl --at X,Y,Z          free a part that is only held where it is gripped (a staff
+                                                     in a hand): the grip is cut through, and what comes loose
+                                                     is written as its own part, with the hole left behind.
+                                                     --keep when the part lies against the model all the way
+                                                     down: then the cut keeps what it contains (--top MM and
+                                                     --top-radius MM widen it for a crook at the top)
+
+Options:
+    --out PATH         file (simplify) or folder (split, free); a sensible name next to the model by default
+    --to N             triangles to come down to (simplify)
+    --scale N          scale the model first: 1.5 makes a 100 mm figure 150 mm
+    --at ...           cut heights in millimetres for split, or a point x,y,z for free
+    --radius MM        how wide to cut through a grip (free), default 6
+    --overlap MM       how far the parts slot into each other (split), default 8
+    --play MM          clearance between the parts that slot together, default 0.25
+    --json             the report as JSON
+
+Every part is written standing on the plate and reported with its own numbers: triangles, size, open edges,
+non-manifold edges. Blender does the geometry; nothing here repairs a mesh by remeshing it, because a voxel
+remesh fuses the thin shells an AI sculpt is full of and craters the model (PrintLine's rule, learned the hard
+way). Install Blender with: sudo pacman -S blender
+"""
+import json, os, shutil, subprocess, sys, tempfile
+
+INSIDE = r'''
+import bpy, bmesh, json, math, os, sys
+from mathutils import Vector
+
+JOB = json.load(open(sys.argv[sys.argv.index("--") + 1]))
+OUT = {"parts": []}
+bpy.context.preferences.edit.use_global_undo = False      # nothing here is ever undone, and the stack costs
+bpy.context.preferences.view.show_splash = False
+
+
+def fresh():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+
+def load(path, scale=1.0):
+    bpy.ops.wm.stl_import(filepath=path)
+    obj = bpy.context.selected_objects[0]
+    bpy.context.view_layer.objects.active = obj
+    if scale != 1.0:
+        obj.scale = (scale, scale, scale)
+        bpy.ops.object.transform_apply(scale=True)
+    return obj
+
+
+def numbers(obj):
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    boundary = sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    nonmanifold = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+    bm.free()
+    return {"triangles": len(mesh.polygons), "size": [round(v, 2) for v in obj.dimensions],
+            "open_edges": boundary, "nonmanifold_edges": nonmanifold}
+
+
+def islands(obj):
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    seen, count = set(), 0
+    for vert in bm.verts:
+        if vert in seen:
+            continue
+        count += 1
+        stack = [vert]
+        while stack:
+            here = stack.pop()
+            if here in seen:
+                continue
+            seen.add(here)
+            stack.extend(e.other_vert(here) for e in here.link_edges)
+    bm.free()
+    return count
+
+
+def only(obj):
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+
+def copy_of(obj, name):
+    twin = obj.copy()
+    twin.data = obj.data.copy()
+    twin.name = name
+    bpy.context.collection.objects.link(twin)
+    return twin
+
+
+def bisect(obj, height, keep):
+    """Cut the object at z = height and keep "below" or "above", filling the cut face."""
+    only(obj)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.bisect(plane_co=(0, 0, height), plane_no=(0, 0, 1), use_fill=True,
+                        clear_inner=(keep == "above"), clear_outer=(keep == "below"))
+    bpy.ops.mesh.select_all(action="DESELECT")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return obj
+
+
+def cut_face_of(obj, height, tolerance=0.001):
+    """The flat faces the bisect left at the cut, as their indices."""
+    found = []
+    for face in obj.data.polygons:
+        if all(abs(obj.data.vertices[i].co.z - height) < tolerance for i in face.vertices):
+            found.append(face.index)
+    return found
+
+
+def cut_islands(obj, height, tolerance=0.001):
+    """The separate flat faces the bisect left at the cut, grouped where they touch: one entry per island, with
+    its area and centre. A cut through a figure holding a staff leaves two: the body and the staff."""
+    faces = [f for f in obj.data.polygons
+             if all(abs(obj.data.vertices[i].co.z - height) < tolerance for i in f.vertices)]
+    owner, groups = {}, []
+    for face in faces:
+        joined = {owner[v] for v in face.vertices if v in owner}
+        group = min(joined) if joined else len(groups)
+        if not joined:
+            groups.append({"faces": [], "area": 0.0, "centre": Vector((0, 0, 0))})
+        for other in joined - {group}:                    # two islands turn out to be one
+            groups[group]["faces"] += groups[other]["faces"]
+            groups[group]["area"] += groups[other]["area"]
+            groups[group]["centre"] += groups[other]["centre"]
+            groups[other] = {"faces": [], "area": 0.0, "centre": Vector((0, 0, 0))}
+            for vertex, where in list(owner.items()):
+                if where == other:
+                    owner[vertex] = group
+        groups[group]["faces"].append(face.index)
+        groups[group]["area"] += face.area
+        groups[group]["centre"] += face.center * face.area
+        for vertex in face.vertices:
+            owner[vertex] = group
+    out = []
+    for group in groups:
+        if group["area"] > 0:
+            middle = group["centre"] / group["area"]
+            out.append({"area": group["area"], "centre": (middle.x, middle.y)})
+    return sorted(out, key=lambda g: -g["area"])
+
+
+def plug_at(centre, radius, bottom, height, sides=64):
+    """A cylinder standing at a point: the spigot the parts meet on, or (a little fatter) the tool that makes
+    the hole for it. Round and convex, which is what keeps the booleans honest."""
+    bpy.ops.mesh.primitive_cylinder_add(vertices=sides, radius=radius, depth=height,
+                                        location=(centre[0], centre[1], bottom + height / 2.0))
+    return bpy.context.active_object
+
+
+def peg_radius(area, wall):
+    """How fat a spigot this cut face can carry: about a third of the face, and always with meat left around
+    it. A staff's cut face is only about 80 mm2, so the wall it keeps is thinner than a robe's."""
+    even = math.sqrt(area / math.pi)                      # the circle of the same area
+    room = even - min(wall, even * 0.45)
+    return max(2.0, min(10.0, max(0.35 * even, min(2.6, room)), room))
+
+
+def boolean(obj, other, how):
+    modifier = obj.modifiers.new("bool", "BOOLEAN")
+    modifier.operation = how
+    modifier.object = other
+    modifier.solver = "EXACT"
+    only(obj)
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
+
+
+def drop_to_plate(obj):
+    bpy.context.view_layer.update()
+    lowest = min((obj.matrix_world @ v.co).z for v in obj.data.vertices)
+    obj.location.z -= lowest
+    only(obj)
+    bpy.ops.object.transform_apply(location=True)
+
+
+def save(obj, path, label):
+    drop_to_plate(obj)
+    only(obj)
+    bpy.ops.wm.stl_export(filepath=path, export_selected_objects=True, apply_modifiers=True)
+    entry = dict(numbers(obj), name=label, path=path)
+    if JOB.get("look"):
+        entry["picture"] = look_at(obj, os.path.splitext(path)[0] + ".png", JOB.get("angle", "iso"))
+    OUT["parts"].append(entry)
+    return entry
+
+
+def look_at(obj, path, angle="iso", pixels=700):
+    """A plain render of one part, so it can be looked at before anyone prints it. Workbench, no materials, no
+    ray tracing: an old laptop does it in a second or two, and what matters is the shape."""
+    scene = bpy.context.scene
+    scene.render.engine = "BLENDER_WORKBENCH"
+    scene.render.resolution_x = scene.render.resolution_y = pixels
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.filepath = path
+    scene.display.shading.light = "STUDIO"
+    scene.display.shading.show_cavity = True
+    hidden = [other for other in bpy.context.scene.objects
+              if other.type == "MESH" and other is not obj and not other.hide_render]
+    for other in hidden:                                  # a part is looked at on its own, not with its neighbours
+        other.hide_render = True
+    middle = sum((obj.matrix_world @ Vector(c) for c in obj.bound_box), Vector()) / 8.0
+    reach = max(obj.dimensions) or 1.0
+    facing = {"front": Vector((0, -1, 0.15)), "iso": Vector((1, -1, 0.55)), "back": Vector((0, 1, 0.15)),
+              "side": Vector((1, 0, 0.15))}[angle].normalized()
+    bpy.ops.object.empty_add(location=middle)
+    target = bpy.context.active_object
+    bpy.ops.object.camera_add(location=middle + facing * reach * 3)
+    camera = bpy.context.active_object
+    camera.data.type = "ORTHO"
+    camera.data.ortho_scale = reach * 1.25
+    aim = camera.constraints.new("TRACK_TO")
+    aim.target = target
+    aim.track_axis, aim.up_axis = "TRACK_NEGATIVE_Z", "UP_Y"
+    scene.camera = camera
+    bpy.ops.render.render(write_still=True)
+    bpy.data.objects.remove(camera, do_unlink=True)
+    bpy.data.objects.remove(target, do_unlink=True)
+    for other in hidden:
+        other.hide_render = False
+    return path
+
+
+def do_render():
+    fresh()
+    obj = load(JOB["source"], JOB.get("scale", 1.0))
+    drop_to_plate(obj)
+    shot = look_at(obj, JOB["out"], JOB.get("angle", "iso"))
+    OUT["parts"].append(dict(numbers(obj), name=os.path.basename(JOB["source"]), path=shot))
+
+
+def do_check():
+    fresh()
+    obj = load(JOB["source"], JOB.get("scale", 1.0))
+    OUT["parts"].append(dict(numbers(obj), name=os.path.basename(JOB["source"]), path=JOB["source"],
+                             islands=islands(obj)))
+
+
+def do_simplify():
+    fresh()
+    obj = load(JOB["source"], JOB.get("scale", 1.0))
+    was = len(obj.data.polygons)
+    wanted = int(JOB["to"])
+    if was > wanted:
+        modifier = obj.modifiers.new("decimate", "DECIMATE")
+        modifier.decimate_type = "COLLAPSE"
+        modifier.ratio = wanted / float(was)
+        only(obj)
+        bpy.ops.object.modifier_apply(modifier=modifier.name)
+    OUT["was"] = was
+    save(obj, JOB["out"], os.path.basename(JOB["out"]))
+
+
+def do_split():
+    fresh()
+    whole = load(JOB["source"], JOB.get("scale", 1.0))
+    drop_to_plate(whole)
+    overlap, play, wall = JOB.get("overlap", 8.0), JOB.get("play", 0.25), JOB.get("wall", 2.5)
+    rest, made = whole, []
+    for number, height in enumerate(sorted(JOB["at"]), start=1):
+        lower = bisect(copy_of(rest, "lower%d" % number), height, "below")
+        upper = bisect(copy_of(rest, "upper%d" % number), height, "above")
+        bpy.data.objects.remove(rest, do_unlink=True)
+        # A joint for every island the cut leaves, not just the big one: a figure holding a staff is cut through
+        # both, and the staff wants its own pin or it only butts. Each island above the cut is paired with the
+        # one below it by where they sit, and the pin is sized to the smaller of the pair.
+        below, above = cut_islands(lower, height), cut_islands(upper, height)
+        joints = 0
+        for island in above:
+            mate = min(below, key=lambda other: (other["centre"][0] - island["centre"][0]) ** 2 +
+                                                (other["centre"][1] - island["centre"][1]) ** 2, default=None)
+            if mate is None:
+                continue
+            apart = math.dist(mate["centre"], island["centre"])
+            area = min(island["area"], mate["area"])
+            radius = peg_radius(area, wall)
+            if apart > 6 or area < 45 or radius < 2.0:
+                continue                                  # nothing below it, or too little face: it just butts
+            centre = ((island["centre"][0] + mate["centre"][0]) / 2, (island["centre"][1] + mate["centre"][1]) / 2)
+            spigot = plug_at(centre, radius, height - 0.6, overlap + 0.6)
+            boolean(lower, spigot, "UNION")               # the plug the part above slides onto
+            bpy.data.objects.remove(spigot, do_unlink=True)
+            socket = plug_at(centre, radius + play, height - 0.8, overlap + play + 1.0)
+            boolean(upper, socket, "DIFFERENCE")          # and the hole it slides into
+            bpy.data.objects.remove(socket, do_unlink=True)
+            joints += 1
+        OUT.setdefault("joints", []).append({"at": height, "spigots": joints})
+        made.append(lower)
+        rest = upper
+    made.append(rest)
+    # A cut can leave a part in more than one piece (the wizard's head keeps the top of his staff beside it).
+    # Those go out as their own files: a slicer asks what to do with a file holding several objects, and each
+    # piece wants its own place on the plate anyway.
+    crumb = JOB.get("crumb", 4.0)
+    number = 0
+    for part in made:
+        for piece in loose_parts(part):
+            if max(piece.dimensions) < crumb or len(piece.data.polygons) <= 50:
+                bpy.data.objects.remove(piece, do_unlink=True)
+                continue
+            number += 1
+            label = "part%d" % number
+            save(piece, os.path.join(JOB["out"], label + ".stl"), label)
+    OUT["overlap"], OUT["play"] = overlap, play
+
+
+def cylinder_at(point, radius, length, along, sides=48):
+    bpy.ops.mesh.primitive_cylinder_add(vertices=sides, radius=radius, depth=length, location=point)
+    cutter = bpy.context.active_object
+    if isinstance(along, list):                           # a line of its own: the cut follows how the part leans
+        axis = Vector(along).normalized()
+        cutter.rotation_mode = "QUATERNION"
+        cutter.rotation_quaternion = Vector((0, 0, 1)).rotation_difference(axis)
+    elif along == "x":
+        cutter.rotation_euler = (0, math.radians(90), 0)
+    elif along == "y":
+        cutter.rotation_euler = (math.radians(90), 0, 0)
+    only(cutter)
+    bpy.ops.object.transform_apply(rotation=True)
+    return cutter
+
+
+def loose_parts(obj):
+    """Split an object wherever it is no longer joined to itself, biggest piece first."""
+    only(obj)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.separate(type="LOOSE")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return sorted([o for o in bpy.context.selected_objects if o.type == "MESH"],
+                  key=lambda o: len(o.data.polygons), reverse=True)
+
+
+def do_free():
+    """Free a part the model grips (a staff in a hand) by cutting the grip away from around it: a tube whose
+    hole is the part itself, so neither the part nor the hand loses anything but the bond between them. What
+    comes loose is written as its own part, and the hand keeps a hole the part slides back into."""
+    fresh()
+    whole = load(JOB["source"], JOB.get("scale", 1.0))
+    drop_to_plate(whole)
+    point = Vector(JOB["at"])
+    radius, along = JOB.get("radius", 6.0), JOB.get("along", "z")
+    length = JOB.get("length") or radius * 6
+    play, grip = JOB.get("play", 0.3), JOB.get("grip", 0.0) or (JOB.get("radius", 6.0) + 7.0)
+    if JOB.get("keep"):
+        # The part is sculpted against the model down its whole length (a staff leaning on a robe), so there is
+        # no single grip to cut: what the cut contains becomes the part, and the model keeps the channel it lay
+        # in. `top` widens the cut above a height, to bring a crook or a finial along with the shaft.
+        held = copy_of(whole, "held")
+        keeper = cylinder_at(point, radius, length, along)
+        crown = None
+        if JOB.get("top"):
+            reach = JOB.get("top_radius", radius * 2.5)
+            here = Vector(point) + Vector(along if isinstance(along, list) else (0, 0, 1)).normalized() * 0
+            crown = cylinder_at((point[0], point[1], JOB["top"] + 40), reach, 80, along)
+            boolean(keeper, crown, "UNION")
+            bpy.data.objects.remove(crown, do_unlink=True)
+        boolean(held, keeper, "INTERSECT")
+        bpy.data.objects.remove(keeper, do_unlink=True)
+        opener = cylinder_at(point, radius + play, length, along)
+        if JOB.get("top"):
+            reach = JOB.get("top_radius", radius * 2.5) + play
+            crown = cylinder_at((point[0], point[1], JOB["top"] + 40), reach, 80, along)
+            boolean(opener, crown, "UNION")
+            bpy.data.objects.remove(crown, do_unlink=True)
+        boolean(whole, opener, "DIFFERENCE")
+        bpy.data.objects.remove(opener, do_unlink=True)
+        for piece in loose_parts(held):
+            piece.name = "held-piece"
+    else:
+        tube = cylinder_at(point, grip, length, along)
+        hole = cylinder_at(point, radius + play, length * 1.3, along)
+        boolean(tube, hole, "DIFFERENCE")                 # a tube: it cuts around the part, never into it
+        bpy.data.objects.remove(hole, do_unlink=True)
+        boolean(whole, tube, "DIFFERENCE")
+        bpy.data.objects.remove(tube, do_unlink=True)
+    crumb = JOB.get("crumb", 4.0)                         # anything smaller than this in every direction is debris
+    pieces, dropped = [], 0
+    everything = loose_parts(whole) + [o for o in bpy.context.scene.objects
+                                       if o.type == "MESH" and o.name.startswith("held")]
+    for piece in everything:
+        if max(piece.dimensions) >= crumb and len(piece.data.polygons) > 50:
+            pieces.append(piece)
+        else:
+            dropped += 1
+            bpy.data.objects.remove(piece, do_unlink=True)
+    OUT["dropped_crumbs"] = dropped
+    pieces.sort(key=lambda o: len(o.data.polygons), reverse=True)
+    for number, piece in enumerate(pieces, start=1):
+        save(piece, os.path.join(JOB["out"], "part%d.stl" % number), "part%d" % number)
+
+
+{"check": do_check, "simplify": do_simplify, "split": do_split, "free": do_free,
+ "render": do_render}[JOB["job"]]()
+print("MAKER-RESULT " + json.dumps(OUT))
+'''
+
+
+class Stop(Exception):
+    """Something the user should hear about; ends the command."""
+
+
+def blender():
+    found = shutil.which("blender")
+    if not found:
+        raise Stop("Blender is not installed here: sudo pacman -S blender")
+    return found
+
+
+def through_blender(job):
+    """Run one job inside Blender and bring back what it reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        job_file = os.path.join(tmp, "job.json")
+        script = os.path.join(tmp, "inside.py")
+        with open(job_file, "w") as handle:
+            json.dump(job, handle)
+        with open(script, "w") as handle:
+            handle.write(INSIDE)
+        proc = subprocess.run([blender(), "--background", "--factory-startup", "--python-exit-code", "1",
+                               "--python", script, "--", job_file],
+                              capture_output=True, text=True, timeout=1800)
+    for line in proc.stdout.splitlines():
+        if line.startswith("MAKER-RESULT "):
+            return json.loads(line[len("MAKER-RESULT "):])
+    tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])
+    raise Stop("Blender did not finish the %s:\n%s" % (job["job"], tail))
+
+
+def report(found, as_json):
+    if as_json:
+        print(json.dumps(found, indent=2))
+        return 0
+    for part in found["parts"]:
+        extra = "  %d loose part(s)" % part["islands"] if "islands" in part else ""
+        extra += ("  picture: " + os.path.basename(part["picture"])) if part.get("picture") else ""
+        print("  %-10s %7d triangles  %6.1f x %5.1f x %5.1f mm  open edges %d  non-manifold %d%s"
+              % (part["name"], part["triangles"], part["size"][0], part["size"][1], part["size"][2],
+                 part["open_edges"], part["nonmanifold_edges"], extra))
+    if "was" in found:
+        print("  from %d triangles" % found["was"])
+    if "overlap" in found:
+        print("  parts slot together %.1f mm deep, %.2f mm of play" % (found["overlap"], found["play"]))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    command, rest = argv[0], argv[1:]
+    options, words = {}, []
+    it = iter(rest)
+    for word in it:
+        if word == "--json":
+            options["json"] = True
+        elif word.startswith("--"):
+            value = next(it, None)
+            if value is None:
+                raise Stop("%s needs a value" % word)
+            options[word[2:]] = value
+        else:
+            words.append(word)
+    if not words:
+        raise Stop("which model?")
+    source = os.path.abspath(words[0])
+    if not os.path.isfile(source):
+        raise Stop("no such model: %s" % source)
+    stem = os.path.splitext(source)[0]
+    scale = float(options.get("scale") or 1.0)
+    job = {"job": command, "source": source, "scale": scale}
+    if command == "check":
+        pass
+    elif command == "render":
+        job.update({"out": os.path.abspath(options.get("out") or stem + ".png"), "angle": options.get("angle", "iso")})
+    elif command == "simplify":
+        job.update({"to": int(options.get("to") or 500000), "out": os.path.abspath(options.get("out") or stem + "-light.stl")})
+    elif command in ("split", "free"):
+        job["out"] = os.path.abspath(options.get("out") or (stem + "-parts"))
+        os.makedirs(job["out"], exist_ok=True)
+        job["look"] = "--no-look" not in argv               # every part gets a picture: numbers are not eyes
+        job["angle"] = options.get("angle", "iso")
+        if command == "split":
+            job["at"] = [float(h) for h in (options.get("at") or "").replace(" ", "").split(",") if h]
+            if not job["at"]:
+                raise Stop("split needs --at MM (one height, or several separated by commas)")
+            job.update({"overlap": float(options.get("overlap") or 8.0), "play": float(options.get("play") or 0.25),
+                        "wall": float(options.get("wall") or 2.5)})
+        else:
+            point = [float(v) for v in (options.get("at") or "").replace(" ", "").split(",") if v]
+            if len(point) != 3:
+                raise Stop("free needs --at X,Y,Z: the point where the part is held")
+            along = options.get("along", "z")
+            if along and "," in along:
+                along = [float(v) for v in along.replace(" ", "").split(",")]
+            job.update({"at": point, "radius": float(options.get("radius") or 6.0), "along": along,
+                        "play": float(options.get("play") or 0.3), "crumb": float(options.get("crumb") or 4.0),
+                        "grip": float(options.get("grip") or 0), "keep": "--keep" in argv,
+                        "top": float(options["top"]) if options.get("top") else None,
+                        "top_radius": float(options.get("top-radius") or 0) or None,
+                        "length": float(options.get("length") or 0) or None})
+            job = {k: v for k, v in job.items() if v is not None}
+    else:
+        print(__doc__.strip())
+        return 2
+    found = through_blender(job)
+    if not options.get("json"):                        # with --json the output is JSON and nothing else
+        print("%s%s" % (os.path.basename(source), (" -> " + job["out"]) if "out" in job else ""))
+    return report(found, options.get("json"))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Stop as problem:
+        print(problem, file=sys.stderr)
+        sys.exit(1)

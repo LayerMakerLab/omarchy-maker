@@ -1,0 +1,1388 @@
+#!/usr/bin/env python3
+"""maker-meshy: a printable model from a description or a picture, with Meshy, ready for OrcaSlicer.
+
+    maker-meshy text "a mossy stone lantern" [options]
+    maker-meshy image PICTURE [options]              a photo or drawing of one object
+    maker-meshy views FRONT [SIDE] [BACK] [options]  up to 4 views of one object (the cleanest meshes)
+    maker-meshy resume [NAME]                        finish jobs that were cut off (Meshy keeps them)
+    maker-meshy pending                              jobs that resume would finish
+    maker-meshy size NAME MM                         a copy of a model at another height (printed path)
+    maker-meshy credits                              your Meshy balance
+    maker-meshy models                               models made so far, newest first
+    maker-meshy check MODEL.stl                      printability report (free)
+    maker-meshy orient MODEL.stl [--out FILE]        the way up that needs the least support (writes the
+                                                     turned copy with --out; --threshold DEGREES, --json)
+    maker-meshy parts NAME [--by "staff, hat, body"]  Meshy's Auto Split: it cuts a model of ours where its
+                                                     parts actually meet and caps every cut, with mortise and
+                                                     tenon connectors (10 credits; --no-connectors, --assembled)
+    maker-meshy split MODEL.stl --at MM[,MM]         cut any model at heights you choose, each part printing
+                                                     flat, with a dowel socket in every cut face (--scale 1.5,
+                                                     --pins 2, --out DIR)
+    maker-meshy simplify MODEL.stl [--simplify MM]   a lighter copy at a resolution the nozzle can print
+                                                     (default 0.2 mm; it says how many edges it opened, and a
+                                                     mesh it opens is one to keep as it was)
+
+Options:
+    --name NAME        folder name (default: from the prompt or the picture)
+    --height MM        scale so the model is this tall (default: Meshy's real-world estimate, shrunk
+                       to fit a 180 mm box when bigger, so it fits A1/P1-sized printers)
+    --texture          keep textures (costs 10 more credits; slicers ignore them)
+    --ultra            Meshy 7 Ultra detail (5 more credits)
+    --no-repair        keep the raw mesh even when it is not watertight
+    --as-said          send the description as typed; without it, a description also asks Meshy for a shape
+                       that prints without support (standing on its own base, nothing thin held out in the air)
+    --orca             put the model on OrcaSlicer's plate when it is ready (maker-orca import)
+    --quiet            no desktop notifications
+
+What a run does, in order: Meshy builds the mesh (untextured, sized to the object's real-world height,
+standing on its base); Meshy checks printability (free) and every edge is counted here too; a mesh
+that is not watertight goes through Meshy's repair (10 credits) and is counted again; the STL is scaled
+to millimetres, stood on Z and centred, and saved with a preview picture under
+~/Projects/3D_Exports/meshy/<name>/, next to meshy.json with everything Meshy reported. A generation
+costs 20 credits (text, picture or views).
+
+The key comes from MESHY_API_KEY or ~/.config/meshy/env and is never printed.
+"""
+import base64, datetime, fcntl, glob, json, math, mimetypes, os, re, shutil, struct, subprocess, sys, threading, time, urllib.error, urllib.request
+
+API = os.environ.get("MESHY_API_BASE", "https://api.meshy.ai")
+KEY_FILE = os.path.expanduser(os.environ.get("MESHY_ENV_FILE", "~/.config/meshy/env"))
+OUT_ROOT = os.path.expanduser(os.environ.get("MESHY_OUT", "~/Projects/3D_Exports/meshy"))
+FIT_MM = 180.0                     # default largest dimension cap: fits A1, P1S, X1 and most bed slingers
+POLL_TIMEOUT = 25 * 60
+POLL_START = float(os.environ.get("MESHY_POLL_START", "3"))    # seconds before the first status check, growing to 10
+ICON = "\U000f01a7"                # nf-md-cube_outline
+
+
+class Stop(Exception):
+    pass
+
+
+class Failed(Stop):
+    """Meshy itself gave up on the job: finishing it again cannot help."""
+
+
+# --------------------------------------------------------------------------------------------- api
+def api_key():
+    key = os.environ.get("MESHY_API_KEY", "").strip()
+    if not key and os.path.exists(KEY_FILE):
+        with open(KEY_FILE) as handle:
+            found = re.search(r"^\s*(?:export\s+)?MESHY_API_KEY\s*=\s*['\"]?([^'\"\s]+)", handle.read(), re.M)
+        key = found.group(1) if found else ""
+    if not key:
+        raise Stop("no Meshy API key: set MESHY_API_KEY or put MESHY_API_KEY=... in %s (chmod 600)" % KEY_FILE)
+    return key
+
+
+def call(method, path, body=None, retries=4):
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(API + path, data=data, method=method, headers={
+        "Authorization": "Bearer " + api_key(), "Content-Type": "application/json", "User-Agent": "omarchy-maker"})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                text = response.read().decode()
+                return json.loads(text) if text.strip() else {}
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode(errors="replace")
+            try:
+                detail = json.loads(detail).get("message", detail)
+            except ValueError:
+                pass
+            if err.code in (401, 403):
+                raise Stop("Meshy refused the API key (HTTP %d)" % err.code)
+            if err.code == 402:
+                raise Stop("not enough Meshy credits: %s" % detail)
+            if err.code == 429 or err.code >= 500:
+                time.sleep(min(30, 3 * (attempt + 1)))
+                continue
+            raise Stop("Meshy said no (HTTP %d): %s" % (err.code, str(detail)[:300]))
+        except (urllib.error.URLError, TimeoutError) as err:
+            if attempt == retries - 1:
+                raise Stop("can't reach Meshy: %s" % err)
+            time.sleep(3 * (attempt + 1))
+    raise Stop("Meshy kept answering busy; try again in a minute")
+
+
+def stream(path, task_id, on_progress=None):
+    """Follow a task over Meshy's server-sent events until it finishes: the finished task, fetched whole. None when the
+    stream is not available, so the caller polls instead."""
+    request = urllib.request.Request("%s%s/%s/stream" % (API, path, task_id), headers={
+        "Authorization": "Bearer " + api_key(), "Accept": "text/event-stream", "User-Agent": "omarchy-maker"})
+    last, event = None, "message"
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            for raw in response:
+                line = raw.decode(errors="replace").strip()
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    task = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                if event == "error":
+                    return None
+                status, progress = task.get("status"), task.get("progress")
+                if on_progress and progress is not None and progress != last and status not in ("SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"):
+                    on_progress(progress)
+                    last = progress
+                if status == "SUCCEEDED":
+                    return call("GET", "%s/%s" % (path, task_id))
+                if status in ("FAILED", "CANCELED", "EXPIRED"):
+                    message = (task.get("task_error") or {}).get("message") or status.lower()
+                    raise Failed("Meshy's task %s: %s" % (status.lower(), message))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    return None
+
+
+FOLLOWED = {}                                         # task id -> "stream" or "polling", kept in meshy.json
+
+
+def wait(path, task_id, on_progress=None):
+    """Follow a task until it finishes (the stream, or polling when the stream is not there); the finished task."""
+    if os.environ.get("MESHY_NO_STREAM") != "1":
+        task = stream(path, task_id, on_progress)
+        if task and task.get("status") == "SUCCEEDED":
+            FOLLOWED[task_id] = "stream"
+            return task
+    FOLLOWED[task_id] = "polling"
+    deadline, delay, last = time.time() + POLL_TIMEOUT, POLL_START, None
+    while time.time() < deadline:
+        task = call("GET", "%s/%s" % (path, task_id))
+        status = task.get("status")
+        if status == "SUCCEEDED":
+            return task
+        if status in ("FAILED", "CANCELED", "EXPIRED"):
+            message = (task.get("task_error") or {}).get("message") or status.lower()
+            raise Failed("Meshy's task %s: %s" % (status.lower(), message))
+        progress = task.get("progress")
+        if on_progress and progress is not None and progress != last:
+            on_progress(progress)
+            last = progress
+        time.sleep(delay)
+        delay = min(max(10.0, POLL_START), delay * 1.3)
+    raise Stop("Meshy took longer than %d minutes; finish it later with: maker-meshy resume" % (POLL_TIMEOUT // 60))
+
+
+def download(url, path):
+    tmp = path + ".part"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "omarchy-maker"}), timeout=300) as response, open(tmp, "wb") as out:
+        shutil.copyfileobj(response, out)
+    os.replace(tmp, path)
+    return path
+
+
+def data_uri(path):
+    kind = mimetypes.guess_type(path)[0] or "image/png"
+    if kind not in ("image/png", "image/jpeg"):
+        raise Stop("Meshy takes .png, .jpg or .jpeg pictures, not %s" % os.path.basename(path))
+    with open(path, "rb") as handle:
+        return "data:%s;base64,%s" % (kind, base64.b64encode(handle.read()).decode())
+
+
+# --------------------------------------------------------------------------------------------- STL
+def read_stl(path):
+    """(triangles as flat float list of 12 per triangle, binary?) for binary or ASCII STL."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if len(data) >= 84:
+        count = struct.unpack("<I", data[80:84])[0]
+        if 84 + count * 50 == len(data):
+            floats = []
+            for tri in struct.iter_unpack("<12fH", data[84:]):
+                floats.extend(tri[:12])
+            return floats
+    text = data.decode(errors="replace")
+    if "facet" not in text:
+        raise Stop("%s is not an STL file" % path)
+    numbers = []
+    for facet in re.finditer(r"facet\s+normal\s+(\S+)\s+(\S+)\s+(\S+)(.*?)endfacet", text, re.S):
+        vertices = re.findall(r"vertex\s+(\S+)\s+(\S+)\s+(\S+)", facet.group(4))
+        if len(vertices) == 3:
+            numbers.extend(float(v) for v in facet.groups()[:3])
+            for vertex in vertices:
+                numbers.extend(float(v) for v in vertex)
+    return numbers
+
+
+def edge_report(path):
+    """(open edges, edges shared by more than two faces) of a binary STL: a mesh slicers call watertight has (0, 0)."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    count = struct.unpack("<I", data[80:84])[0] if len(data) >= 84 else 0
+    if 84 + count * 50 != len(data):
+        return None                                       # ASCII STL: leave it to Meshy's check
+    edges = {}
+    get = edges.get
+    for start in range(84, len(data), 50):
+        a, b, c = data[start + 12:start + 24], data[start + 24:start + 36], data[start + 36:start + 48]
+        for key in ((a + b) if a < b else (b + a), (b + c) if b < c else (c + b), (c + a) if c < a else (a + c)):
+            edges[key] = get(key, 0) + 1
+    open_edges = sum(1 for n in edges.values() if n == 1)
+    return open_edges, sum(1 for n in edges.values() if n > 2)
+
+
+def bounds(floats):
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    for i in range(0, len(floats), 12):
+        for v in (3, 6, 9):
+            for axis in range(3):
+                value = floats[i + v + axis]
+                lo[axis] = min(lo[axis], value)
+                hi[axis] = max(hi[axis], value)
+    return lo, hi
+
+
+def write_stl(path, floats, scale=1.0, lift=(0.0, 0.0, 0.0)):
+    """Binary STL, every vertex scaled and then moved by lift."""
+    count = len(floats) // 12
+    with open(path + ".part", "wb") as out:
+        out.write(b"omarchy-maker maker-meshy".ljust(80, b" ") + struct.pack("<I", count))
+        pack = struct.Struct("<12fH").pack
+        for i in range(0, count * 12, 12):
+            n = floats[i:i + 3]
+            v = floats[i + 3:i + 12]
+            out.write(pack(n[0], n[1], n[2],
+                           v[0] * scale + lift[0], v[1] * scale + lift[1], v[2] * scale + lift[2],
+                           v[3] * scale + lift[0], v[4] * scale + lift[1], v[5] * scale + lift[2],
+                           v[6] * scale + lift[0], v[7] * scale + lift[1], v[8] * scale + lift[2], 0))
+    os.replace(path + ".part", path)
+
+
+# ----------------------------------------------------------------------------- which way up it should print
+# Supports are the thing to avoid, and which way up a model prints decides most of them. Every way up worth
+# trying is scored here, on the mesh, before Orca ever sees it: how much of the model overhangs steeper than a
+# printer manages on its own, and how much of that overhang sits over the model itself. A support standing on
+# the model leaves a mark on it, so that area is what the ranking hates most; support from the plate is the
+# next thing to keep down.
+OVERHANG_DEGREES = 45          # steeper than this off vertical wants support (PLA on a Bambu takes 45 cleanly)
+BED_SKIN = 0.3                 # a facet within this of the lowest point counts as resting on the plate
+CELL_MM = 1.0                  # the grid the model is dropped into to see what sits under an overhang
+SCORE_FACETS = 18_000          # facets scored per candidate; the full mesh decides the winner's own numbers
+STAND_CM2 = 1.5                # a way up that touches the plate less than this falls over, and we print no brims
+STAND_SHARE = 0.10             # and it has to cover this much of its own footprint
+
+
+def facet_table(floats):
+    """Per facet: unit normal, area, vertices. The STL's own normals are not trusted, they are recomputed."""
+    normals, areas, verts = [], [], []
+    for i in range(0, len(floats), 12):
+        ax, ay, az = floats[i + 3], floats[i + 4], floats[i + 5]
+        bx, by, bz = floats[i + 6], floats[i + 7], floats[i + 8]
+        cx, cy, cz = floats[i + 9], floats[i + 10], floats[i + 11]
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        vx, vy, vz = cx - ax, cy - ay, cz - az
+        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length <= 1e-12:
+            continue                                      # a facet with no area says nothing about anything
+        normals.append((nx / length, ny / length, nz / length))
+        areas.append(length / 2.0)
+        verts.append((ax, ay, az, bx, by, bz, cx, cy, cz))
+    return normals, areas, verts
+
+
+def candidate_downs(normals, areas, most=16):
+    """The ways up worth trying, as the direction that will face the plate: the model as it is, the six axis
+    directions, and the normal of every flat face big enough to rest on (normals binned to about 10 degrees)."""
+    bins = {}
+    for (nx, ny, nz), area in zip(normals, areas):
+        key = (round(nx * 6), round(ny * 6), round(nz * 6))
+        total, sx, sy, sz = bins.get(key, (0.0, 0.0, 0.0, 0.0))
+        bins[key] = (total + area, sx + nx * area, sy + ny * area, sz + nz * area)
+    faces = []
+    for total, sx, sy, sz in sorted(bins.values(), reverse=True)[:most]:
+        length = math.sqrt(sx * sx + sy * sy + sz * sz)
+        if length > 1e-9:
+            faces.append((sx / length, sy / length, sz / length))
+    wanted = [(0.0, 0.0, -1.0)]                           # first candidate is the model as it stands
+    for down in faces + [(0, 0, 1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, -1)]:
+        if not any(down[0] * o[0] + down[1] * o[1] + down[2] * o[2] > 0.985 for o in wanted):
+            wanted.append(tuple(float(v) for v in down))
+    return wanted
+
+
+def sampled(items, most):
+    """Every nth item, with the factor to multiply their areas by. Scoring reads areas, not shapes, so a
+    tenth of the facets answers to about a percent and a big mesh stays quick."""
+    stride = max(1, len(items) // most)
+    return items[::stride], float(stride)
+
+
+def score_down(normals, areas, verts, down, threshold=OVERHANG_DEGREES, full=False):
+    """What printing with `down` against the plate would cost: overhang area (cm2), the part of it sitting over
+    the model rather than over the plate, the area resting on the plate, and the height in mm."""
+    dx, dy, dz = down
+    limit = math.sin(math.radians(threshold))
+    picked_n, factor = (normals, 1.0) if full else sampled(normals, SCORE_FACETS)
+    picked_a = areas if full else areas[::max(1, len(areas) // SCORE_FACETS)]
+    picked_v = verts if full else verts[::max(1, len(verts) // SCORE_FACETS)]
+    bed = -math.inf
+    low = math.inf
+    for ax, ay, az, bx, by, bz, cx, cy, cz in picked_v:   # the plate is the far end along `down`
+        for x, y, z in ((ax, ay, az), (bx, by, bz), (cx, cy, cz)):
+            t = x * dx + y * dy + z * dz
+            if t > bed:
+                bed = t
+            if t < low:
+                low = t
+    right, back, _ = axes_across(down)
+    span_u = span_v = None
+    for ax, ay, az, bx, by, bz, cx, cy, cz in picked_v:
+        for x, y, z in ((ax, ay, az), (bx, by, bz), (cx, cy, cz)):
+            u = x * right[0] + y * right[1] + z * right[2]
+            v = x * back[0] + y * back[1] + z * back[2]
+            span_u = (u, u) if span_u is None else (min(span_u[0], u), max(span_u[1], u))
+            span_v = (v, v) if span_v is None else (min(span_v[0], v), max(span_v[1], v))
+    footprint = ((span_u[1] - span_u[0]) * (span_v[1] - span_v[0]) / 100.0) if span_u else 0.0
+    overhangs, on_bed = [], 0.0
+    for (nx, ny, nz), area, tri in zip(picked_n, picked_a, picked_v):
+        facing = nx * dx + ny * dy + nz * dz               # 1 points straight at the plate, 0 is a vertical wall
+        if facing <= limit:
+            continue
+        near = min(tri[i] * dx + tri[i + 1] * dy + tri[i + 2] * dz for i in (0, 3, 6))
+        if near >= bed - BED_SKIN:
+            on_bed += area * factor                        # this facet is what the model stands on
+        else:
+            overhangs.append((tri, area * factor))
+    over_model = under_model(picked_v, overhangs, down, bed)
+    total = sum(area for _tri, area in overhangs)
+    base = on_bed / 100.0
+    return {"overhang": total / 100.0, "over_model": over_model / 100.0, "base": base,
+            "height": bed - low, "footprint": footprint, "down": down,
+            "stands": base >= STAND_CM2 and base >= STAND_SHARE * footprint}
+
+
+def under_model(verts, overhangs, down, bed):
+    """Of the overhanging area, how much has model under it: a support there would stand on the model and mark
+    it. The model is dropped into 1 mm cells and each cell remembers how far from the plate its nearest
+    surface is; an overhang with a surface between it and the plate is one that cannot be reached from below."""
+    if not overhangs:
+        return 0.0
+    right, back, _ = axes_across(down)
+    cells = {}
+    for ax, ay, az, bx, by, bz, cx, cy, cz in verts:
+        for x, y, z in ((ax, ay, az), (bx, by, bz), (cx, cy, cz)):
+            u = (x * right[0] + y * right[1] + z * right[2]) / CELL_MM
+            v = (x * back[0] + y * back[1] + z * back[2]) / CELL_MM
+            key = (int(u // 1), int(v // 1))
+            depth = bed - (x * down[0] + y * down[1] + z * down[2])   # 0 at the plate, up into the model
+            known = cells.get(key)
+            if known is None or depth < known:
+                cells[key] = depth
+    marked = 0.0
+    for tri, area in overhangs:
+        u = sum(tri[i] * right[0] + tri[i + 1] * right[1] + tri[i + 2] * right[2] for i in (0, 3, 6)) / 3.0
+        v = sum(tri[i] * back[0] + tri[i + 1] * back[1] + tri[i + 2] * back[2] for i in (0, 3, 6)) / 3.0
+        depth = sum(tri[i] * down[0] + tri[i + 1] * down[1] + tri[i + 2] * down[2] for i in (0, 3, 6)) / 3.0
+        depth = bed - depth
+        under = cells.get((int((u / CELL_MM) // 1), int((v / CELL_MM) // 1)))
+        if under is not None and under < depth - 1.0:      # a surface a millimetre or more below it
+            marked += area
+    return marked
+
+
+def axes_across(down):
+    """Two directions across the plate for a model printed with `down` facing it, and `down` itself."""
+    helper = (1.0, 0.0, 0.0) if abs(down[0]) < 0.9 else (0.0, 1.0, 0.0)
+    rx = helper[1] * down[2] - helper[2] * down[1]
+    ry = helper[2] * down[0] - helper[0] * down[2]
+    rz = helper[0] * down[1] - helper[1] * down[0]
+    length = math.sqrt(rx * rx + ry * ry + rz * rz) or 1.0
+    right = (rx / length, ry / length, rz / length)
+    back = (down[1] * right[2] - down[2] * right[1], down[2] * right[0] - down[0] * right[2],
+            down[0] * right[1] - down[1] * right[0])
+    return right, back, down
+
+
+def cost_of(score):
+    """One number for a way up, in square centimetres: what hangs in the air, counted twice over where its
+    support would have to stand on the model, less what it rests on — a big flat face on the plate is worth
+    real overhang elsewhere, which is why a cut part almost always wants its cut face down."""
+    return score["overhang"] + 2 * score["over_model"] - 0.5 * score["base"]
+
+
+def rank(scores):
+    """Ways up it can stand on first (balanced on a point it falls over, and we print no brims), then the
+    cheapest by cost_of, then the shortest. Rounded to half a square centimetre so a rounding error does not
+    decide anything."""
+    return sorted(scores, key=lambda s: (not s["stands"], round(cost_of(s) * 2) / 2, round(s["height"], 1)))
+
+
+def rotation_to_down(down):
+    """The 3x3 rotation that turns `down` into straight down, so the model prints that way up."""
+    dx, dy, dz = down
+    ax, ay, az = -dy, dx, 0.0                             # cross(down, (0, 0, -1))
+    sin = math.sqrt(ax * ax + ay * ay + az * az)
+    cos = -dz
+    if sin < 1e-9:
+        return ((1, 0, 0), (0, 1, 0), (0, 0, 1)) if cos > 0 else ((1, 0, 0), (0, -1, 0), (0, 0, -1))
+    ax, ay, az = ax / sin, ay / sin, az / sin
+    angle = math.atan2(sin, cos)
+    s, c, t = math.sin(angle), math.cos(angle), 1 - math.cos(angle)
+    return ((t * ax * ax + c, t * ax * ay - s * az, t * ax * az + s * ay),
+            (t * ax * ay + s * az, t * ay * ay + c, t * ay * az - s * ax),
+            (t * ax * az - s * ay, t * ay * az + s * ax, t * az * az + c))
+
+
+def turn(floats, matrix):
+    """Every normal and vertex through the rotation, in place."""
+    (m00, m01, m02), (m10, m11, m12), (m20, m21, m22) = matrix
+    for i in range(0, len(floats), 3):
+        x, y, z = floats[i], floats[i + 1], floats[i + 2]
+        floats[i] = m00 * x + m01 * y + m02 * z
+        floats[i + 1] = m10 * x + m11 * y + m12 * z
+        floats[i + 2] = m20 * x + m21 * y + m22 * z
+    return floats
+
+
+def describe_turn(down):
+    """The turn in words: nothing when the model already prints that way up."""
+    dx, dy, dz = down
+    degrees = round(math.degrees(math.acos(max(-1.0, min(1.0, -dz)))))
+    if degrees < 3:
+        return "already the right way up"
+    axis = "X" if abs(dy) >= abs(dx) else "Y"             # turning about X tips it front to back
+    return "turned %d degrees about %s" % (degrees, axis)
+
+
+def orient_file(source, target=None, threshold=OVERHANG_DEGREES):
+    """Score every way up, write the best one out (unless it is the way it already is) and report all of them."""
+    floats = read_stl(source)
+    normals, areas, verts = facet_table(floats)
+    if not normals:
+        raise Stop("%s has no facets to orient" % os.path.basename(source))
+    scores = [score_down(normals, areas, verts, down, threshold) for down in candidate_downs(normals, areas)]
+    ranked = rank(scores)
+    best, now = ranked[0], scores[0]                       # scores[0] is the model as it stands
+    best = score_down(normals, areas, verts, best["down"], threshold, full=True)
+    now = score_down(normals, areas, verts, now["down"], threshold, full=True)
+    turned = describe_turn(best["down"])
+    written = None
+    if target and turned != "already the right way up":
+        turn(floats, rotation_to_down(best["down"]))
+        lo, hi = bounds(floats)
+        write_stl(target, floats, 1.0, (-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]))
+        written = target
+    return {"turn": turned, "written": written, "best": best, "as_it_is": now,
+            "others": [s for s in ranked[1:4]]}
+
+# ------------------------------------------------------------------------------------- cutting into parts
+# A figure that is one piece prints with everything the pose makes awkward hanging in the air. Cut into parts,
+# each part gets its own flat face on the plate and needs no support at all, and the parts are glued after. The
+# cut faces get sockets for a dowel, so the parts line up on their own and the glue has something to hold.
+PIN_MM = (6.0, 12.0)           # dowel across and long: the sizes already printed and tested here
+PIN_PLAY = 0.30                # radius added to the socket: the middle of the 0.20 / 0.30 / 0.40 tests
+PIN_RING = 24                  # segments around a dowel and its socket
+
+
+def cut_at(floats, height):
+    """Split the mesh at z = `height` into (below, above, seam segments). A triangle wholly on one side is
+    copied as it is; one the plane goes through is clipped into both sides, which is where the seam comes from."""
+    below, above, seam = [], [], []
+    for i in range(0, len(floats), 12):
+        tri = [(floats[i + 3], floats[i + 4], floats[i + 5]),
+               (floats[i + 6], floats[i + 7], floats[i + 8]),
+               (floats[i + 9], floats[i + 10], floats[i + 11])]
+        zs = [p[2] for p in tri]
+        if max(zs) <= height:
+            below.extend(floats[i:i + 12])
+            continue
+        if min(zs) >= height:
+            above.extend(floats[i:i + 12])
+            continue
+        low, high, crossings = [], [], []
+        for a in range(3):
+            p, q = tri[a], tri[(a + 1) % 3]
+            (low if p[2] <= height else high).append(p)
+            if (p[2] - height) * (q[2] - height) < 0:
+                t = (height - p[2]) / (q[2] - p[2])
+                point = (p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]), height)
+                low.append(point)
+                high.append(point)
+                crossings.append(point)
+        if len(crossings) == 2:
+            seam.append((crossings[0], crossings[1]))
+        below.extend(fan(low))
+        above.extend(fan(high))
+    return below, above, seam
+
+
+def fan(points):
+    """A polygon (given in order around itself) as triangles, in the flat float form STLs use."""
+    out = []
+    for a in range(1, len(points) - 1):
+        out.extend([0.0, 0.0, 0.0])
+        for point in (points[0], points[a], points[a + 1]):
+            out.extend(point)
+    return out
+
+
+def loops_from(seam, tol=1e-4):
+    """The seam segments chained into closed rings, each a list of (x, y) going round once."""
+    ends = {}
+    key = lambda p: (round(p[0] / tol), round(p[1] / tol))
+    for a, b in seam:
+        if key(a) == key(b):
+            continue
+        ends.setdefault(key(a), []).append((a, b))
+        ends.setdefault(key(b), []).append((b, a))
+    seen, rings = set(), []
+    for start in list(ends):
+        if start in seen:
+            continue
+        ring, here, guard = [], start, 0
+        while here in ends and here not in seen and guard < 200_000:
+            seen.add(here)
+            guard += 1
+            step = next((s for s in ends[here] if key(s[1]) not in seen), None)
+            if step is None:
+                step = ends[here][0]
+                ring.append((step[0][0], step[0][1]))
+                break
+            ring.append((step[0][0], step[0][1]))
+            here = key(step[1])
+        if len(ring) >= 3:
+            rings.append(ring)
+    return rings
+
+
+def area_of(ring):
+    """Twice the signed area: positive when the ring goes anticlockwise seen from above."""
+    total = 0.0
+    for a in range(len(ring)):
+        x1, y1 = ring[a]
+        x2, y2 = ring[(a + 1) % len(ring)]
+        total += x1 * y2 - x2 * y1
+    return total
+
+
+def circle(centre, radius, segments=PIN_RING, clockwise=False):
+    step = 2 * math.pi / segments
+    points = [(centre[0] + radius * math.cos(a * step), centre[1] + radius * math.sin(a * step))
+              for a in range(segments)]
+    return points[::-1] if clockwise else points
+
+
+def bridge(outer, hole):
+    """Join a hole into its outer ring so one ring is left: the classic bridge, cut at the hole's rightmost
+    point and the nearest outer point the bridge can reach without crossing anything."""
+    start = max(range(len(hole)), key=lambda i: hole[i][0])
+    reach = sorted(range(len(outer)), key=lambda i: (outer[i][0] - hole[start][0]) ** 2 +
+                                                    (outer[i][1] - hole[start][1]) ** 2)
+    for target in reach:
+        if clear(outer[target], hole[start], outer, hole):
+            turned = hole[start:] + hole[:start + 1]
+            return outer[:target + 1] + turned + outer[target:]
+    turned = hole[start:] + hole[:start + 1]
+    return outer[:reach[0] + 1] + turned + outer[reach[0]:]
+
+
+def clear(a, b, *rings):
+    """The line from a to b crosses none of these rings (its own end points do not count as crossings)."""
+    for ring in rings:
+        for i in range(len(ring)):
+            c, d = ring[i], ring[(i + 1) % len(ring)]
+            if c in (a, b) or d in (a, b):
+                continue
+            if crosses(a, b, c, d):
+                return False
+    return True
+
+
+def side(a, b, p):
+    return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+
+
+def crosses(a, b, c, d):
+    return (side(a, b, c) > 0) != (side(a, b, d) > 0) and (side(c, d, a) > 0) != (side(c, d, b) > 0)
+
+
+def inside(p, a, b, c):
+    d1, d2, d3 = side(a, b, p), side(b, c, p), side(c, a, p)
+    return not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
+
+
+def ear_clip(ring):
+    """A simple polygon as triangles. Ears are cut off one by one, which is slow for thousands of points and
+    exact enough for a cut face of a few hundred."""
+    points = list(ring)
+    if area_of(points) < 0:
+        points.reverse()
+    out, guard = [], 0
+    while len(points) > 3 and guard < 20_000:
+        guard += 1
+        for i in range(len(points)):
+            a, b, c = points[i - 2], points[i - 1], points[i]
+            if side(a, b, c) <= 0:
+                continue                                  # not a convex corner
+            if any(inside(p, a, b, c) for j, p in enumerate(points)
+                   if p not in (a, b, c) and j not in ((i - 2) % len(points), (i - 1) % len(points), i)):
+                continue
+            out.append((a, b, c))
+            points.pop(i - 1)
+            break
+        else:
+            break                                         # nothing left to cut: the rest is handled below
+    for a in range(1, len(points) - 1):
+        out.append((points[0], points[a], points[a + 1]))
+    return out
+
+
+def cap_face(rings, holes, height, up):
+    """The flat face of a cut, with a socket hole around each pin: triangles in the flat float form."""
+    out = []
+    for ring in rings:
+        merged = list(ring)
+        if area_of(merged) < 0:
+            merged.reverse()
+        for hole in holes:
+            if point_in(hole[0], ring):
+                merged = bridge(merged, hole)
+        for a, b, c in ear_clip(merged):
+            triangle = [(a[0], a[1], height), (b[0], b[1], height), (c[0], c[1], height)]
+            if not up:
+                triangle.reverse()
+            out.extend([0.0, 0.0, 0.0] + [v for point in triangle for v in point])
+    return out
+
+
+def point_in(point, ring):
+    inside_ring = False
+    for i in range(len(ring)):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % len(ring)]
+        if (y1 > point[1]) != (y2 > point[1]):
+            if point[0] < x1 + (point[1] - y1) / (y2 - y1) * (x2 - x1):
+                inside_ring = not inside_ring
+    return inside_ring
+
+
+def socket(centre, radius, top, depth, segments=PIN_RING):
+    """A blind hole: the wall down from the cut face, and a flat bottom. Its rim is the hole in the face."""
+    out, bottom = [], top - depth
+    ring = circle(centre, radius, segments)
+    for i in range(segments):
+        a, b = ring[i], ring[(i + 1) % segments]
+        for triangle in (((a[0], a[1], top), (a[0], a[1], bottom), (b[0], b[1], bottom)),
+                         ((a[0], a[1], top), (b[0], b[1], bottom), (b[0], b[1], top))):
+            out.extend([0.0, 0.0, 0.0] + [v for point in triangle for v in point])
+    centre_point = (centre[0], centre[1], bottom)
+    for i in range(segments):
+        a, b = ring[i], ring[(i + 1) % segments]
+        out.extend([0.0, 0.0, 0.0] + list(centre_point) + [b[0], b[1], bottom] + [a[0], a[1], bottom])
+    return out
+
+
+def room_at(point, rings, want):
+    """The point sits inside the outer ring and `want` millimetres clear of every edge."""
+    if not point_in(point, rings[0]):
+        return False
+    for ring in rings:
+        for i in range(len(ring)):
+            a, b = ring[i], ring[(i + 1) % len(ring)]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length = dx * dx + dy * dy
+            t = 0.0 if length == 0 else max(0.0, min(1.0, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length))
+            near = (a[0] + t * dx, a[1] + t * dy)
+            if math.dist(point, near) < want:
+                return False
+    return True
+
+
+def pin_places(rings, wanted, radius):
+    """Where the dowels go in a cut face. Every spot on a grid across the face that has meat all around it is a
+    candidate, and the ones furthest apart win: two dowels far apart stop the joint twisting, which one in the
+    middle cannot. A face too narrow for a dowel gets none rather than one breaking out of its side."""
+    ring = max(rings, key=lambda r: abs(area_of(r)))
+    xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+    want = radius + 1.5
+    step = max(1.5, min(max(xs) - min(xs), max(ys) - min(ys)) / 14.0)
+    candidates = []
+    y = min(ys) + step / 2
+    while y < max(ys):
+        x = min(xs) + step / 2
+        while x < max(xs):
+            spot = (x, y)
+            if point_in(spot, ring) and room_at(spot, rings, want):
+                candidates.append(spot)
+            x += step
+        y += step
+    if not candidates:
+        return [], ring
+    middle = (sum(xs) / len(xs), sum(ys) / len(ys))
+    if wanted <= 1:
+        return [min(candidates, key=lambda p: math.dist(p, middle))], ring
+    pair = max(((a, b) for i, a in enumerate(candidates) for b in candidates[i + 1:]),
+               key=lambda both: math.dist(*both), default=None)
+    if pair is None or math.dist(*pair) < 3 * radius:
+        return [min(candidates, key=lambda p: math.dist(p, middle))], ring
+    spots = list(pair)
+    while len(spots) < wanted:                            # more than two: each next one as far from the rest as it can be
+        far = max(candidates, key=lambda p: min(math.dist(p, other) for other in spots))
+        if min(math.dist(far, other) for other in spots) < 3 * radius:
+            break
+        spots.append(far)
+    return spots[:wanted], ring
+
+
+def dowel(across, long, segments=PIN_RING):
+    """The pin itself, standing on the plate: a plain cylinder, printed on its end."""
+    out, radius = [], across / 2.0
+    ring = circle((0.0, 0.0), radius, segments)
+    for i in range(segments):
+        a, b = ring[i], ring[(i + 1) % segments]
+        for triangle in (((a[0], a[1], 0.0), (b[0], b[1], 0.0), (b[0], b[1], long)),
+                         ((a[0], a[1], 0.0), (b[0], b[1], long), (a[0], a[1], long))):
+            out.extend([0.0, 0.0, 0.0] + [v for point in triangle for v in point])
+        out.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0] + [b[0], b[1], 0.0] + [a[0], a[1], 0.0])
+        out.extend([0.0, 0.0, 0.0, 0.0, 0.0, long] + [a[0], a[1], long] + [b[0], b[1], long])
+    return out
+
+def simplify_mesh(floats, grid):
+    """Fewer triangles by snapping every vertex onto a `grid` millimetre lattice and dropping the triangles that
+    collapse to nothing. A sculpt from a generator carries far more detail than a 0.2 mm nozzle can lay down;
+    snapping at about a layer height keeps what prints and throws away what does not. Shared corners snap the
+    same way, so the parts stay joined."""
+    out = []
+    step = 1.0 / grid
+    for i in range(0, len(floats), 12):
+        tri = []
+        for v in (3, 6, 9):
+            tri.append((round(floats[i + v] * step), round(floats[i + v + 1] * step), round(floats[i + v + 2] * step)))
+        if tri[0] == tri[1] or tri[1] == tri[2] or tri[2] == tri[0]:
+            continue                                      # the triangle fell inside one cell
+        out.extend([0.0, 0.0, 0.0])
+        for point in tri:
+            out.extend((point[0] * grid, point[1] * grid, point[2] * grid))
+    return out
+
+
+def volume_of(floats):
+    """The volume a closed mesh encloses, in cubic millimetres. Negative means the faces are inside out, which
+    is worth knowing about a part before a printer is asked to make sense of it."""
+    total = 0.0
+    for i in range(0, len(floats), 12):
+        ax, ay, az = floats[i + 3], floats[i + 4], floats[i + 5]
+        bx, by, bz = floats[i + 6], floats[i + 7], floats[i + 8]
+        cx, cy, cz = floats[i + 9], floats[i + 10], floats[i + 11]
+        total += (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6.0
+    return total
+
+
+def move_mesh(floats, scale=1.0, lift=(0.0, 0.0, 0.0)):
+    for i in range(0, len(floats), 12):
+        for v in (3, 6, 9):
+            for axis in range(3):
+                floats[i + v + axis] = floats[i + v + axis] * scale + lift[axis]
+    return floats
+
+
+def split_file(source, heights, out_dir, scale=1.0, pins=2, pin=PIN_MM, play=PIN_PLAY, names=None):
+    """Cut a model into parts at the given heights, socket every cut face for a dowel, and write each part
+    standing on the plate. Returns what was written, with the numbers to check it by."""
+    floats = read_stl(source)
+    lo, hi = bounds(floats)
+    move_mesh(floats, scale, (0.0, 0.0, 0.0))
+    lo, hi = bounds(floats)
+    move_mesh(floats, 1.0, (-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]))
+    radius = pin[0] / 2.0 + play
+    deep = pin[1] / 2.0 + 0.5                             # half the dowel each side, and room for the glue
+    os.makedirs(out_dir, exist_ok=True)
+    made, rest, carry = [], floats, 0
+    for number, height in enumerate(sorted(heights), start=1):
+        below, above, seam = cut_at(rest, height)
+        rings = loops_from(seam)
+        if not rings:
+            raise Stop("nothing to cut at %.1f mm: the model is not there" % height)
+        spots, ring = pin_places(rings, pins, radius)
+        holes = [circle(spot, radius, clockwise=True) for spot in spots]
+        below += cap_face(rings, holes, height, up=True)
+        above += cap_face(rings, holes, height, up=False)
+        for spot in spots:
+            below += socket(spot, radius, height, deep)
+            above += socket(spot, radius, height, -deep)
+        made.append({"floats": below, "pins": carry + len(spots)})
+        carry, rest = len(spots), above
+    made.append({"floats": rest, "pins": carry})
+    written = []
+    for number, part in enumerate(made, start=1):
+        label = (names or {}).get(number) or "part%d" % number
+        target = os.path.join(out_dir, "%s.stl" % label)
+        part_floats = part["floats"]
+        lo, hi = bounds(part_floats)
+        move_mesh(part_floats, 1.0, (0.0, 0.0, -lo[2]))   # every part stands on the plate on its own
+        write_stl(target, part_floats)
+        edges = edge_report(target)
+        written.append({"name": label, "path": target, "triangles": len(part_floats) // 12,
+                        "size": [round(hi[a] - lo[a], 1) for a in range(3)], "sockets": part["pins"],
+                        "open_edges": edges[0] if edges else None,
+                        "volume_cm3": round(volume_of(part_floats) / 1000.0, 2)})
+    pin_path = os.path.join(out_dir, "dowel-%gx%g.stl" % pin)
+    write_stl(pin_path, dowel(*pin))
+    return {"parts": written, "dowel": pin_path, "socket_radius": round(radius, 2), "socket_depth": round(deep, 2)}
+
+
+def stand_up(floats, lo, hi):
+    """Meshy's STLs stand on Z (origin at the bottom). A mesh whose bottom sits on Y instead (glTF's up)
+    is turned so Y becomes Z. Returns True when it turned the mesh."""
+    size = [hi[a] - lo[a] for a in range(3)]
+    near_zero = lambda a: abs(lo[a]) <= 0.002 * (size[a] or 1)
+    centred = lambda a: abs(lo[a] + hi[a]) <= 0.2 * (size[a] or 1)
+    if near_zero(2) or not (near_zero(1) and centred(2)):
+        return False
+    for i in range(0, len(floats), 12):
+        for v in (0, 3, 6, 9):                            # normal and the three vertices: (x, y, z) -> (x, -z, y)
+            y, z = floats[i + v + 1], floats[i + v + 2]
+            floats[i + v + 1], floats[i + v + 2] = -z, y
+    return True
+
+
+def to_millimetres(source, target, height=None):
+    """Scale the mesh to millimetres and set it on the bed: return (size in mm, why it was scaled).
+    Meshy's STLs come out in millimetres; a mesh smaller than 10 units is taken as metres."""
+    floats = read_stl(source)
+    lo, hi = bounds(floats)
+    if stand_up(floats, lo, hi):
+        lo, hi = bounds(floats)
+    size = [hi[a] - lo[a] for a in range(3)]
+    largest = max(size) or 1.0
+    unit = 1000.0 if largest < 10 else 1.0
+    scale, why = unit, "Meshy's real-world size"
+    if height:
+        scale, why = height / (size[2] or largest), "%g mm tall" % height
+    if max(size) * scale > FIT_MM and not height:
+        scale, why = FIT_MM / largest, "shrunk to fit %d mm" % FIT_MM
+    lift = (-lo[0] * scale - size[0] * scale / 2, -lo[1] * scale - size[1] * scale / 2, -lo[2] * scale)
+    write_stl(target, floats, scale, lift)
+    return [round(s * scale, 1) for s in size], why
+
+
+# --------------------------------------------------------------------------------------------- desktop
+class Notice:
+    """One notification, updated in place as the job goes."""
+
+    def __init__(self, quiet):
+        self.quiet = quiet or not shutil.which("omarchy-notification-send")
+        self.id = None
+
+    def say(self, headline, text="", image=None, click=None, seconds=30):
+        """Omarchy shows a toast for 5 to 30 seconds (it treats "never expire" as 5), then keeps it in its history."""
+        print(("%s: %s" % (headline, text)) if text else headline, flush=True)
+        if self.quiet:
+            return
+        args = ["omarchy-notification-send", "-g", ICON, "-t", str(int(seconds * 1000))]
+        if self.id:
+            args += ["-r", self.id]
+        else:
+            args += ["-p"]
+        if image:
+            args += ["--image", image]
+        args += [headline, text]
+        if click:
+            args += ["--exec"] + click
+        out = subprocess.run(args, capture_output=True, text=True)
+        if not self.id and out.stdout.strip().isdigit():
+            self.id = out.stdout.strip()
+
+
+def save_json(path, data):
+    with open(path + ".part", "w") as out:
+        json.dump(data, out, indent=2)
+    os.replace(path + ".part", path)
+
+
+def short_name(text, limit=40):
+    """A description short enough to name a model in menus and notifications."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0].rstrip(",.;:") + "\u2026"
+
+
+def slug(text):
+    words = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-").split("-")
+    return "-".join(words[:6])[:48] or "model"
+
+
+def new_folder(name):
+    base = os.path.join(OUT_ROOT, slug(name))
+    path, n = base, 2
+    while os.path.exists(path):
+        path, n = "%s-%d" % (base, n), n + 1
+    os.makedirs(path)
+    return path
+
+
+# --------------------------------------------------------------------------------------------- jobs
+KINDS = {
+    "text": ("/openapi/v2/text-to-3d", "a description"),
+    "image": ("/openapi/v1/image-to-3d", "a picture"),
+    "views": ("/openapi/v1/multi-image-to-3d", "several views"),
+}
+SPLIT_PATH = "/openapi/v1/print/split"      # Meshy's own Auto Split: it knows a staff from a sleeve
+
+
+# A model that never needs support is better than a model with the least support, and with a description we
+# get a say in that before anything is built. Meshy answers to shape words, so the ask carries the shape a
+# printer wants: standing on its own base, its own parts carrying what sticks out, nothing thin in the air.
+PRINTABLE_ASK = ("standing flat and stable on its own solid base, arms legs tail and other parts tucked close "
+                 "to the body and resting on the base or on the body itself, no thin pieces held out in the "
+                 "air, no steep undercuts, solid connected shape for FDM 3D printing")
+
+
+def printable_prompt(words):
+    """The description with the shape a printer wants added, unless it already says something of the sort."""
+    if re.search(r"\b(fdm|3d[- ]?print|printable|support[- ]free|no support)", words, re.I):   # "printing" counts too
+        return words
+    room = 800 - len(PRINTABLE_ASK) - 2
+    return "%s, %s" % (words[:room].rstrip(", "), PRINTABLE_ASK)
+
+
+def generate(kind, subject, options):
+    """From words or pictures to a printable model (and onto Orca's plate with --orca)."""
+    notice = Notice(options.get("quiet"))                # one toast from "sending" to "on the plate"
+    return finish(begin(kind, subject, options, notice)["folder"], options, notice)
+
+
+def begin(kind, subject, options, notice=None):
+    """Send the job to Meshy and write its folder: what finish needs, even from another process later."""
+    path, what = KINDS[kind]
+    label = options.get("name") or (short_name(subject) if kind == "text" else os.path.splitext(os.path.basename(subject[0]))[0])
+    body = {"ai_model": "latest", "target_formats": ["stl", "glb"], "auto_size": True, "origin_at": "bottom"}
+    if options.get("ultra"):
+        body["ultra_mode"] = True
+    if kind == "text":
+        if len(subject) > 800:
+            raise Stop("Meshy takes descriptions up to 800 characters")
+        asked = subject if options.get("as_said") else printable_prompt(subject)
+        body.update({"mode": "preview", "prompt": asked})
+    elif kind == "image":
+        body.update({"image_url": data_uri(subject[0]), "should_texture": bool(options.get("texture"))})
+    else:
+        if not 1 <= len(subject) <= 4:
+            raise Stop("give 1 to 4 views of the same object, front view first")
+        body.update({"image_urls": [data_uri(p) for p in subject], "should_texture": bool(options.get("texture"))})
+
+    (notice or Notice(options.get("quiet"))).say("Meshy · %s" % label, "sending %s to Meshy" % what)
+    task_id = call("POST", path, body).get("result")
+    if not task_id:
+        raise Stop("Meshy did not return a task id")
+    folder = new_folder(label)
+    record = {"name": label, "kind": kind, "prompt": subject if kind == "text" else None,
+              "pictures": subject if kind != "text" else None, "task_id": task_id,
+              "started": datetime.datetime.now().isoformat(timespec="seconds"), "folder": folder,
+              "options": {k: options[k] for k in ("height", "no_repair") if options.get(k)}}
+    save_json(os.path.join(folder, "meshy.json"), record)
+    return record
+
+
+def job_lock(folder):
+    """An open, locked file while a process works on this job; None when another process already does."""
+    handle = open(os.path.join(folder, ".working"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def unfinished(root=None):
+    """Folders of jobs Meshy accepted that were cut off before the model was made (and nobody is finishing now)."""
+    found = []
+    for meta in sorted(glob.glob(os.path.join(root or OUT_ROOT, "*", "meshy.json")), key=os.path.getmtime, reverse=True):
+        try:
+            with open(meta) as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if record.get("task_id") and not record.get("finished") and not record.get("failed"):
+            lock = job_lock(os.path.dirname(meta))
+            if lock:
+                lock.close()
+                found.append(os.path.dirname(meta))
+    return found
+
+
+def finish(folder, options=None, notice=None):
+    """Wait for a job Meshy accepted and make the printable model. Safe to run again on a job that was cut off."""
+    meta = os.path.join(folder, "meshy.json")
+    with open(meta) as handle:
+        record = json.load(handle)
+    options = dict(record.get("options") or {}, **{k: v for k, v in (options or {}).items() if v is not None})
+    lock = job_lock(folder)
+    if not lock:
+        raise Stop("%s is being finished already" % record.get("name"))
+    try:
+        return _finish(folder, record, options, notice or Notice(options.get("quiet")))
+    except Failed as problem:
+        record["failed"] = str(problem)
+        save_json(meta, record)
+        raise
+    finally:
+        lock.close()
+        try:
+            os.remove(os.path.join(folder, ".working"))
+        except OSError:
+            pass
+
+
+def _finish(folder, record, options, notice):
+    label, task_id = record["name"], record["task_id"]
+    path = KINDS[record["kind"]][0]
+    meta = os.path.join(folder, "meshy.json")
+    timings, clock = {}, time.time()
+
+    def lap(name):
+        nonlocal clock
+        timings[name] = round(time.time() - clock, 1)
+        clock = time.time()
+
+    task = wait(path, task_id, lambda p: notice.say("Meshy · %s" % label, "building the model: %d%%" % p))
+    lap("meshy_builds")
+    record["followed"] = FOLLOWED.get(task_id)
+    record["credits"] = task.get("consumed_credits")
+    urls = task.get("model_urls") or {}
+    if not urls.get("stl"):
+        raise Failed("Meshy finished without an STL (formats: %s)" % ", ".join(k for k, v in urls.items() if v))
+    checked = {}                                          # Meshy's free printability report arrives on the side
+    checker = threading.Thread(target=lambda: checked.update(report=analyze(task_id)), daemon=True)
+    checker.start()
+    raw = download(urls["stl"], os.path.join(folder, "meshy-original.stl"))
+    if task.get("thumbnail_url"):
+        try:
+            download(task["thumbnail_url"], os.path.join(folder, "preview.png"))
+        except (urllib.error.URLError, OSError):
+            pass
+    lap("download")
+
+    edges = edge_report(raw)                              # every edge of a closed mesh belongs to exactly two faces
+    record["edges"] = {"open": edges[0], "shared_by_3_or_more": edges[1]} if edges else None
+    if edges:
+        needs_repair = edges != (0, 0)
+    else:                                                 # an ASCII STL: Meshy's report decides
+        checker.join(120)
+        metrics = (checked.get("report") or {}).get("metrics") or {}
+        needs_repair = bool(checked.get("report")) and (
+            not metrics.get("is_watertight", True) or metrics.get("holes", 0) or metrics.get("non_manifold_edges", 0))
+    lap("check")
+    source = raw
+    if needs_repair and not options.get("no_repair"):
+        notice.say("Meshy · %s" % label, "not watertight yet: repairing (10 credits)")
+        try:
+            repaired = repair(urls["stl"])
+            record["repair"] = {k: repaired.get(k) for k in ("id", "consumed_credits")}
+            source = download(repaired["model_urls"]["stl"], os.path.join(folder, "meshy-repaired.stl"))
+            edges = edge_report(source)
+            record["repair"]["edges"] = {"open": edges[0], "shared_by_3_or_more": edges[1]} if edges else None
+        except Failed:
+            raise
+        except (Stop, urllib.error.URLError, OSError, KeyError) as problem:
+            record["repair"] = {"error": str(problem)[:300]}      # keep the mesh as made; Orca usually closes small gaps
+            print("repair failed, keeping the mesh as made: %s" % problem, file=sys.stderr)
+        lap("repair")
+
+    final = os.path.join(folder, os.path.basename(folder) + ".stl")   # Orca names the object after the file
+    size, why = to_millimetres(source, final, options.get("height"))
+    closed = edges == (0, 0) if edges else not needs_repair
+    record.update({"model": final, "size_mm": size, "sizing": why, "repaired": source != raw, "watertight": closed,
+                   "finished": datetime.datetime.now().isoformat(timespec="seconds"), "timings": timings})
+    save_json(meta, record)
+
+    if closed:
+        state = "repaired, watertight" if record["repaired"] else "watertight"
+    else:
+        state = "still has %d open edges" % edges[0] if edges and edges[0] else "not watertight (Orca usually fixes this)"
+    text = "%s × %s × %s mm, %s, %s" % (size[0], size[1], size[2], state, why)
+    preview = os.path.join(folder, "preview.png")
+    image = preview if os.path.exists(preview) else None
+    orca = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-orca")
+    click = [orca, "import", final] if os.access(orca, os.X_OK) else None
+    placed = False
+    if options.get("orca") and click:
+        # onto the plate of a running Orca; a closed Orca stays closed and the notification opens it
+        placed = subprocess.run([orca, "import", "--if-running", "--quiet", final]).returncode == 0
+    if placed:
+        notice.say("On the plate: %s" % label, text, image=image, seconds=12)
+    else:
+        notice.say("Ready: %s" % label, text + (" · click here, or Ctrl+Alt+I in Orca, to put it on the plate" if click else ""),
+                   image=image, click=click)
+    record["placed_in_orca"] = placed
+    save_json(meta, record)
+    print(final, flush=True)
+    checker.join(30)                                      # keep Meshy's report with the model when it comes in time
+    if checked.get("report") is not None:
+        record["printability"] = checked["report"]
+        save_json(meta, record)
+    return record
+
+
+def sized_copy(name, height):
+    """<name>-<height>mm.stl next to a finished model, from Meshy's best mesh (repaired when there is one).
+    A copy made before is used again."""
+    folder = name if os.path.isdir(name) else os.path.join(OUT_ROOT, name)
+    if not os.path.isfile(os.path.join(folder, "meshy.json")):
+        raise Stop("no Meshy model %s" % name)
+    source = next((os.path.join(folder, f) for f in ("meshy-repaired.stl", "meshy-original.stl")
+                   if os.path.isfile(os.path.join(folder, f))), None)
+    if not source:
+        raise Stop("%s has no mesh from Meshy yet" % os.path.basename(folder))
+    target = os.path.join(folder, "%s-%gmm.stl" % (os.path.basename(folder), height))
+    if not (os.path.isfile(target) and os.path.getmtime(target) >= os.path.getmtime(source)):
+        to_millimetres(source, target, height)
+    return target
+
+
+def analyze(task_id):
+    """Meshy's free printability report for a finished task, or None when Meshy can't analyze it."""
+    try:
+        check_id = call("POST", "/openapi/v1/print/analyze", {"input_task_id": task_id}).get("result")
+        return wait("/openapi/v1/print/analyze", check_id).get("printability") if check_id else None
+    except Stop as problem:
+        print("printability check skipped: %s" % problem, file=sys.stderr)
+        return None
+
+
+def repair(stl_url):
+    repair_id = call("POST", "/openapi/v1/print/repair", {"model_url": stl_url}).get("result")
+    if not repair_id:
+        raise Stop("Meshy did not start the repair")
+    task = wait("/openapi/v1/print/repair", repair_id)
+    if not (task.get("model_urls") or {}).get("stl"):
+        raise Stop("Meshy's repair returned no STL")
+    return task
+
+
+# --------------------------------------------------------------------------------------------- commands
+def cmd_credits():
+    balance = call("GET", "/openapi/v1/balance").get("balance")
+    print("Meshy credits: %s (a model costs 20)" % balance)
+    return balance
+
+
+def list_models():
+    models = []
+    for meta in sorted(glob.glob(os.path.join(OUT_ROOT, "*", "meshy.json")), key=os.path.getmtime, reverse=True):
+        try:
+            with open(meta) as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if record.get("model") and os.path.exists(record["model"]):
+            models.append(record)
+    return models
+
+
+def cmd_models():
+    models = list_models()
+    if not models:
+        print("No Meshy models yet (%s)" % OUT_ROOT)
+    for record in models:
+        size = "×".join(str(s) for s in record.get("size_mm") or [])
+        print("%-28s %-16s %s  %s" % (record["name"][:28], size, record.get("finished", "")[:16], record["model"]))
+    return 0
+
+
+def cmd_check(path):
+    """Free printability report for a local model (sent as a data URL)."""
+    if os.path.getsize(path) > 90 * 1024 * 1024:
+        raise Stop("Meshy checks models up to 100 MB")
+    with open(path, "rb") as handle:
+        url = "data:model/stl;base64," + base64.b64encode(handle.read()).decode()
+    check_id = call("POST", "/openapi/v1/print/analyze", {"model_url": url}).get("result")
+    report = wait("/openapi/v1/print/analyze", check_id).get("printability") or {}
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def cmd_simplify(source, out, grid):
+    """Write a lighter copy of a model: the same shape, at a resolution a nozzle can actually print."""
+    floats = read_stl(source)
+    was = len(floats) // 12
+    lighter = simplify_mesh(floats, grid)
+    write_stl(out, lighter)
+    edges = edge_report(out)
+    print("%s: %d triangles -> %d (%.0f%% fewer) at a %.2f mm grid, open edges %s"
+          % (os.path.basename(source), was, len(lighter) // 12, 100 * (1 - len(lighter) / max(1, len(floats))),
+             grid, edges[0] if edges else "?"))
+    print("  written to %s" % out)
+    if edges and edges[0]:
+        print("  it opened %d edges: snapping corners together can tear a mesh, so print the original unless a "
+              "slicer is happy with this one" % edges[0])
+    return 0
+
+
+def cmd_split(source, heights, out_dir, scale=1.0, pins=2, as_json=False):
+    """Cut a model into parts that each print flat on the plate, with dowel sockets in every cut face."""
+    found = split_file(source, heights, out_dir, scale=scale, pins=pins)
+    if as_json:
+        print(json.dumps(found, indent=2))
+        return 0
+    print("%s -> %s" % (os.path.basename(source), out_dir))
+    for part in found["parts"]:
+        print("  %-10s %6d triangles  %6.1f x %5.1f x %5.1f mm  %d socket(s)  %6.1f cm3  open edges: %s"
+              % (part["name"], part["triangles"], part["size"][0], part["size"][1], part["size"][2],
+                 part["sockets"], part["volume_cm3"], part["open_edges"]))
+    print("  dowel %s, sockets %.2f mm radius, %.1f mm deep each side"
+          % (os.path.basename(found["dowel"]), found["socket_radius"], found["socket_depth"]))
+    return 0
+
+
+def cmd_parts(name, by=None, connectors=True, plate=True, formats=("3mf", "obj"), quiet=False):
+    """Meshy's Auto Split: it finds where the parts of a model meet (a staff and the hand around it, a hat and
+    the head under it) and cuts there, capping every cut closed, which a plane through the middle cannot do.
+    Only models Meshy itself made can be split, so this takes the folder of one of ours. 10 credits."""
+    folder = name if os.path.isdir(name) else os.path.join(OUT_ROOT, name)
+    record_path = os.path.join(folder, "meshy.json")
+    if not os.path.isfile(record_path):
+        raise Stop("no Meshy model called %s (maker-meshy models lists them)" % os.path.basename(name))
+    with open(record_path) as handle:
+        record = json.load(handle)
+    task_id = record.get("task_id")
+    if not task_id:
+        raise Stop("%s has no Meshy task to split" % record.get("name"))
+    body = {"input_task_id": task_id, "target_formats": list(formats),
+            "layout": "on_plate" if plate else "assembled", "connectors": bool(connectors),
+            "connector_type": "cylinder", "connector_size": 0.5, "connector_height": 0.3}
+    if by:
+        body.update({"mode": "by_parts", "prompt": by[:600]})
+    notice = Notice(quiet)
+    notice.say("Meshy · %s" % record.get("name"), "asking Meshy to split it into parts")
+    split_id = call("POST", SPLIT_PATH, body).get("result")
+    if not split_id:
+        raise Stop("Meshy did not start the split")
+    task = {}
+    started = time.time()
+    while time.time() - started < POLL_TIMEOUT:
+        task = call("GET", "%s/%s" % (SPLIT_PATH, split_id), retries=2)
+        status = task.get("status")
+        if status in ("SUCCEEDED", "FAILED", "CANCELED"):
+            break
+        notice.say("Meshy · %s" % record.get("name"), "splitting: %d%%" % (task.get("progress") or 0))
+        time.sleep(5)
+    if task.get("status") != "SUCCEEDED":
+        raise Stop("Meshy's split %s: %s" % (task.get("status", "did not finish"),
+                                             (task.get("task_error") or {}).get("message", "")))
+    out_dir = os.path.join(folder, "parts")
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for kind, url in (task.get("model_urls") or {}).items():
+        if url and kind in formats:
+            target = os.path.join(out_dir, "%s-parts.%s" % (record.get("name", "model"), kind))
+            download(url, target)
+            written.append(target)
+    record["split"] = {"task_id": split_id, "parts": task.get("part_count"), "connectors": bool(connectors),
+                       "by": by, "credits": task.get("consumed_credits"), "files": written}
+    with open(record_path, "w") as handle:
+        json.dump(record, handle, indent=2)
+    notice.say("Meshy · %s" % record.get("name"),
+               "%s parts, %s" % (task.get("part_count"), ", ".join(os.path.basename(f) for f in written)))
+    for path in written:
+        print(path)
+    return 0
+
+
+def cmd_orient(source, out=None, threshold=OVERHANG_DEGREES, as_json=False):
+    """Print how each way up would print, and write the best one out when --out says where."""
+    found = orient_file(source, out, threshold)
+    if as_json:
+        print(json.dumps(found, indent=2))
+        return 0
+    best, now = found["best"], found["as_it_is"]
+    print("%s: %s" % (os.path.basename(source), found["turn"]))
+    for label, score in (("as it is", now), ("best way up", best)):
+        print("  %-12s overhang %5.1f cm2   over the model %4.1f cm2   on the plate %5.1f cm2   %5.1f mm tall%s"
+              % (label, score["overhang"], score["over_model"], score["base"], score["height"],
+                 "" if score["stands"] else "   (too little to stand on)"))
+    if found["written"]:
+        print("  written to %s" % found["written"])
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    command, rest = argv[0], argv[1:]
+    options, words = {}, []
+    try:
+        it = iter(rest)
+        for word in it:
+            if word in ("--texture", "--ultra", "--no-repair", "--orca", "--quiet", "--as-said"):
+                options[word[2:].replace("-", "_")] = True
+            elif word == "--json":
+                options["json"] = True
+            elif word in ("--name", "--height", "--out", "--threshold", "--at", "--scale", "--pins", "--simplify", "--by"):
+                value = next(it, None)
+                if value is None:
+                    raise Stop("%s needs a value" % word)
+                options[word[2:]] = float(value) if word in ("--height", "--threshold") else value
+            else:
+                words.append(word)
+        if command == "text" and words:
+            generate("text", " ".join(words), options)
+        elif command in ("image", "views") and words:
+            for picture in words:
+                if not os.path.isfile(picture):
+                    raise Stop("no such picture: %s" % picture)
+            generate(command, words, options)
+        elif command == "resume":
+            folders = [os.path.abspath(w) if os.path.isdir(w) else os.path.join(OUT_ROOT, w) for w in words] or unfinished()
+            if not folders:
+                print("No Meshy jobs to finish")
+            for folder in folders:
+                if not os.path.isfile(os.path.join(folder, "meshy.json")):
+                    raise Stop("no Meshy job in %s" % folder)
+                finish(folder, options)
+        elif command == "size" and len(words) == 2:
+            print(sized_copy(words[0], float(words[1])))
+        elif command == "pending":
+            for folder in unfinished():
+                with open(os.path.join(folder, "meshy.json")) as handle:
+                    print("%s\t%s" % (json.load(handle).get("name"), folder))
+        elif command == "credits":
+            cmd_credits()
+        elif command == "models":
+            cmd_models()
+        elif command == "check" and words:
+            cmd_check(words[0])
+        elif command == "parts" and words:
+            return cmd_parts(words[0], options.get("by"), "--no-connectors" not in argv,
+                             "--assembled" not in argv, quiet=options.get("quiet"))
+        elif command == "split" and words:
+            heights = [float(h) for h in (options.get("at") or "").split(",") if h.strip()]
+            if not heights:
+                raise Stop("split needs --at MM (one height, or several separated by commas)")
+            return cmd_split(words[0], heights, options.get("out") or os.path.join(os.path.dirname(words[0]) or ".", "parts"),
+                             float(options.get("scale") or 1.0), int(options.get("pins") or 2), options.get("json"))
+        elif command == "simplify" and words:
+            return cmd_simplify(words[0], options.get("out") or (os.path.splitext(words[0])[0] + "-light.stl"),
+                                float(options.get("simplify") or 0.2))
+        elif command == "orient" and words:
+            return cmd_orient(words[0], options.get("out"), options.get("threshold") or OVERHANG_DEGREES,
+                              options.get("json"))
+        elif command == "status" and words:
+            for path, _what in KINDS.values():
+                try:
+                    task = call("GET", "%s/%s" % (path, words[0]), retries=1)
+                    print(json.dumps({k: task.get(k) for k in ("status", "progress", "consumed_credits", "task_error")}, indent=2))
+                    return 0
+                except Stop:
+                    continue
+            raise Stop("no Meshy task %s" % words[0])
+        else:
+            print(__doc__.strip())
+            return 2
+    except Stop as problem:
+        if not options.get("quiet") and shutil.which("omarchy-notification-send"):
+            subprocess.run(["omarchy-notification-send", "-g", ICON, "-u", "normal", "-t", "8000", "Meshy", str(problem)], capture_output=True)
+        print("maker-meshy: %s" % problem, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

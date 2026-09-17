@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSCAD
+GenericName=Programmatic 3D modeller
+Comment=The programmers' solid 3D CAD modeller (omarchy-maker launcher)
+Icon=@ICON@
+Exec=@BIN@/maker-run openscad %f
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=application/x-openscad;
+Keywords=3D;CAD;OpenSCAD;scad;parametric;model;stl;
+StartupNotify=false
+StartupWMClass=OpenSCAD
+X-OmarchyMaker=1

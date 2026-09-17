@@ -1,0 +1,39 @@
+{
+ "plate-list": {
+  "box_left": 388,
+  "dx": 380,
+  "dy": 185,
+  "scale": 2.0
+ },
+ "plate-menu": {
+  "dx": 0,
+  "dy": 0,
+  "scale": 2.0
+ },
+ "printer-list": {
+  "box_left": 66,
+  "dx": 58,
+  "dy": 185,
+  "scale": 2.0
+ },
+ "process-tabs": {
+  "dx": 0,
+  "dy": 370,
+  "scale": 2.0
+ },
+ "strength-panel": {
+  "dx": 0,
+  "dy": 414,
+  "scale": 2.0
+ },
+ "support-panel": {
+  "dx": 0,
+  "dy": 414,
+  "scale": 2.0
+ },
+ "tabs": {
+  "dx": 0,
+  "dy": 34,
+  "scale": 2.0
+ }
+}

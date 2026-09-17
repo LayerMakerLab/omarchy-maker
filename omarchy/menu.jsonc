@@ -1,0 +1,7 @@
+  // omarchy-maker:begin (managed by omarchy-maker; edits inside this block are replaced)
+  "install.maker": {"icon":"󰐫","label":"3D Printing","description":"Slicers that work on Omarchy"},
+  "install.maker.orca": {"icon":"󰐫","label":"OrcaSlicer","when":"! $HOME/.local/bin/maker has orca","action":"omarchy-launch-floating-terminal-with-presentation '$HOME/.local/bin/maker install orca'"},
+  "install.maker.bambu": {"icon":"󰐫","label":"Bambu Studio","when":"! $HOME/.local/bin/maker has bambu","action":"omarchy-launch-floating-terminal-with-presentation '$HOME/.local/bin/maker install bambu'"},
+  "setup.maker": {"icon":"󰐫","label":"3D Printing","description":"Check slicers, launchers and file types","action":"omarchy-launch-floating-terminal-with-presentation '$HOME/.local/bin/maker doctor'"},
+  "update.maker": {"icon":"󰐫","label":"Slicers","when":"[[ -d $HOME/.local/share/omarchy-maker/apps ]]","action":"omarchy-launch-floating-terminal-with-presentation '$HOME/.local/bin/maker update'"},
+  // omarchy-maker:end

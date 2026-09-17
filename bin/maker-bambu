@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""maker-bambu: read Bambu Lab printers over the local network (standard library only).
+
+A Bambu printer runs an MQTT broker on port 8883. Anyone on the network holding the printer's LAN
+access code can subscribe to device/<serial>/report and receive its whole state as JSON. Watching
+works while the printer stays signed in to Bambu's cloud; this tool only watches.
+
+    maker-bambu cert HOST          serial number and certificate fingerprint (no access code needed)
+    maker-bambu check              connect once, wait for the first report, print a summary
+    maker-bambu watch              stay connected, print one JSON status per change (for the widget)
+    maker-bambu discover [SECS]    listen for printers announcing themselves on the network
+    maker-bambu info               firmware, loaded filament, AMS units (read-only)
+    maker-bambu unload             unload the external spool (needs BAMBU_CONFIRM=unload)
+    maker-bambu print              start BAMBU_FILE from the printer's storage (needs BAMBU_CONFIRM=print)
+    maker-bambu snapshot FILE.jpg  one chamber camera frame (P1 and A1; LAN Mode Liveview on)
+    maker-bambu light on|off       chamber light
+
+check and watch take everything from the environment, never from argv (other users can read argv):
+    BAMBU_HOST, BAMBU_SERIAL, BAMBU_ACCESS_CODE, BAMBU_FINGERPRINT
+
+The certificate is pinned: the access code only goes out after the printer presents the certificate
+recorded when it was added, so a different device on the same address never receives it.
+"""
+import hashlib, json, os, socket, ssl, struct, sys, tempfile, time
+
+PORT = 8883
+TIMEOUT = 10
+KEEPALIVE = 60
+PING_EVERY = 30
+SILENCE_LIMIT = 90        # the printer reports wifi signal every few seconds even when idle
+PUSHALL_EVERY = 900       # full-state refresh; deltas carry progress in between (P1s dislike frequent pushall)
+BACKOFF_MAX = 60
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def fail(msg, code=1):
+    sys.stderr.write("maker-bambu: " + msg + "\n")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------------- TLS + identity
+def tls_connect(host):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # The certificate names a serial number, not a host, and is signed by Bambu's private CA, so
+    # normal verification cannot apply; the fingerprint pin below replaces it.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection((host, PORT), timeout=TIMEOUT)
+    return ctx.wrap_socket(raw)
+
+
+def cert_info(sock):
+    der = sock.getpeercert(binary_form=True)
+    fingerprint = hashlib.sha256(der).hexdigest()
+    serial = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(ssl.DER_cert_to_PEM_cert(der))
+            path = f.name
+        decoded = ssl._ssl._test_decode_cert(path)
+        os.unlink(path)
+        for rdn in decoded.get("subject", ()):
+            for key, value in rdn:
+                if key == "commonName":
+                    serial = value
+    except Exception:
+        pass
+    return serial, fingerprint
+
+
+# ------------------------------------------------------------------------------------ MQTT 3.1.1
+def varint(n):
+    b = bytearray()
+    while True:
+        d, n = n % 128, n // 128
+        b.append(d | (0x80 if n else 0))
+        if not n:
+            return bytes(b)
+
+
+def mqtt_str(s):
+    s = s.encode() if isinstance(s, str) else s
+    return struct.pack("!H", len(s)) + s
+
+
+def packet(first, body):
+    return bytes([first]) + varint(len(body)) + body
+
+
+def read_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("printer closed the connection")
+        buf += chunk
+    return buf
+
+
+def read_packet(sock):
+    first = read_exact(sock, 1)[0]
+    mult, length = 1, 0
+    while True:
+        d = read_exact(sock, 1)[0]
+        length += (d & 0x7F) * mult
+        if not d & 0x80:
+            break
+        mult *= 128
+        if mult > 128 ** 3:
+            raise ValueError("bad packet length")
+    if length > 8 * 1024 * 1024:
+        raise ValueError("packet too large")
+    return first, read_exact(sock, length) if length else b""
+
+
+def mqtt_session(host, serial, code, fingerprint):
+    """Connected, authenticated and subscribed socket. Raises with a readable message."""
+    sock = tls_connect(host)
+    got_serial, got_fp = cert_info(sock)
+    if fingerprint and got_fp != fingerprint:
+        sock.close()
+        raise PermissionError("a different device answers at %s (certificate changed); add the printer again" % host)
+    client = "omarchy-maker-%d" % os.getpid()
+    flags = 0xC2  # username, password, clean session
+    body = mqtt_str("MQTT") + bytes([4, flags]) + struct.pack("!H", KEEPALIVE) + mqtt_str(client) + mqtt_str("bblp") + mqtt_str(code)
+    sock.sendall(packet(0x10, body))
+    first, payload = read_packet(sock)
+    if first >> 4 != 2 or len(payload) < 2:
+        raise ConnectionError("unexpected answer to CONNECT")
+    rc = payload[1]
+    if rc in (4, 5):
+        raise PermissionError("the printer refused the access code")
+    if rc != 0:
+        raise ConnectionError("printer refused the connection (code %d)" % rc)
+    topic = "device/%s/report" % serial
+    sock.sendall(packet(0x82, struct.pack("!H", 1) + mqtt_str(topic) + b"\x00"))
+    return sock
+
+
+def publish(sock, topic, obj):
+    sock.sendall(packet(0x30, mqtt_str(topic) + json.dumps(obj).encode()))
+
+
+def pushall(sock, serial):
+    publish(sock, "device/%s/request" % serial, {"pushing": {"sequence_id": "0", "command": "pushall", "version": 1, "push_target": 1}})
+
+
+# ------------------------------------------------------------------------------ state -> status
+STATES = {"RUNNING": "printing", "PREPARE": "printing", "SLICING": "printing", "PAUSE": "paused",
+          "FINISH": "complete", "FAILED": "error", "IDLE": "standby"}
+
+
+def merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
+def num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def status_from(p):
+    raw = str(p.get("gcode_state") or "")
+    state = STATES.get(raw, "standby" if not raw else raw.lower())
+    percent = num(p.get("mc_percent"))
+    remaining = num(p.get("mc_remaining_time"))
+    layer, total = p.get("layer_num"), p.get("total_layer_num")
+    message = ""
+    if raw == "PREPARE":
+        message = "Preparing"
+    err = p.get("print_error")
+    if state == "error" and err:
+        message = "Print error %08X" % int(err)
+    name = p.get("subtask_name") or p.get("gcode_file") or ""
+    running = state in ("printing", "paused")
+    return {
+        "state": state,
+        "message": message,
+        "filename": str(name) if (running or state in ("complete", "error")) else "",
+        "progress": max(0.0, min(1.0, (percent or 0) / 100.0)),
+        "remainingSeconds": int(remaining * 60) if remaining is not None and running else None,
+        "currentLayer": int(layer) if isinstance(layer, (int, float)) and total else None,
+        "totalLayer": int(total) if isinstance(total, (int, float)) and total else None,
+        "extruder": num(p.get("nozzle_temper")), "extruderTarget": num(p.get("nozzle_target_temper")),
+        "bed": num(p.get("bed_temper")), "bedTarget": num(p.get("bed_target_temper")),
+        "chamber": num(p.get("chamber_temper")),
+    }
+
+
+def env_printer():
+    need = ["BAMBU_HOST", "BAMBU_SERIAL", "BAMBU_ACCESS_CODE"]
+    missing = [n for n in need if not os.environ.get(n)]
+    if missing:
+        fail("missing " + ", ".join(missing), 2)
+    return os.environ["BAMBU_HOST"], os.environ["BAMBU_SERIAL"], os.environ["BAMBU_ACCESS_CODE"], os.environ.get("BAMBU_FINGERPRINT", "")
+
+
+def reports(sock, serial):
+    """Yield merged 'print' dicts as reports arrive; handles pings and periodic pushall."""
+    state = {}
+    last_ping = last_rx = time.monotonic()
+    last_push = 0.0
+    sock.settimeout(5)
+    while True:
+        now = time.monotonic()
+        if now - last_push > PUSHALL_EVERY:
+            pushall(sock, serial)
+            last_push = now
+        if now - last_ping > PING_EVERY:
+            sock.sendall(b"\xc0\x00")
+            last_ping = now
+        if now - last_rx > SILENCE_LIMIT:
+            raise ConnectionError("the printer went quiet")
+        try:
+            first, payload = read_packet(sock)
+        except socket.timeout:
+            continue
+        last_rx = time.monotonic()
+        if first >> 4 != 3:
+            continue
+        tlen = struct.unpack("!H", payload[:2])[0]
+        body = payload[2 + tlen + (2 if (first >> 1) & 3 else 0):]
+        try:
+            msg = json.loads(body)
+        except ValueError:
+            continue
+        if isinstance(msg.get("print"), dict):
+            merge(state, msg["print"])
+            yield state
+
+
+def printer_info(p, versions):
+    vt = p.get("vt_tray") or {}
+    ams = (p.get("ams") or {}).get("ams") or []
+    return {
+        "firmware": {m.get("name"): m.get("sw_ver") for m in versions if m.get("name") in ("ota", "mc", "th", "ams", "ahb")},
+        "external_spool": {k: vt.get(k) for k in ("tray_type", "tray_sub_brands", "tray_color", "nozzle_temp_min", "nozzle_temp_max", "remain") if k in vt},
+        "ams_units": len(ams),
+        "gcode_state": p.get("gcode_state"),
+        "stage": p.get("stg_cur"),
+        "nozzle": p.get("nozzle_temper"),
+    }
+
+
+def session_messages(sock, serial, seconds):
+    """Every JSON message on the report topic for a while (print and info alike)."""
+    end = time.monotonic() + seconds
+    sock.settimeout(1)
+    while time.monotonic() < end:
+        try:
+            first, payload = read_packet(sock)
+        except socket.timeout:
+            continue
+        if first >> 4 != 3:
+            continue
+        tlen = struct.unpack("!H", payload[:2])[0]
+        try:
+            yield json.loads(payload[2 + tlen + (2 if (first >> 1) & 3 else 0):])
+        except ValueError:
+            continue
+
+
+# ------------------------------------------------------------------------------------- commands
+def cmd_cert(host):
+    try:
+        sock = tls_connect(host)
+    except OSError as e:
+        fail("no answer from %s:%d (%s)" % (host, PORT, e))
+    serial, fp = cert_info(sock)
+    sock.close()
+    out({"host": host, "serial": serial, "fingerprint": fp})
+
+
+def cmd_check():
+    host, serial, code, fp = env_printer()
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+        deadline = time.monotonic() + 20
+        pushall(sock, serial)
+        for p in reports(sock, serial):
+            if "gcode_state" in p or time.monotonic() > deadline:
+                st = status_from(p)
+                st["ok"] = True
+                out(st)
+                sock.close()
+                return
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+
+
+def cmd_info():
+    host, serial, code, fp = env_printer()
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+    pushall(sock, serial)
+    publish(sock, "device/%s/request" % serial, {"info": {"sequence_id": "0", "command": "get_version"}})
+    state, versions = {}, []
+    for msg in session_messages(sock, serial, 12):
+        if isinstance(msg.get("print"), dict):
+            merge(state, msg["print"])
+        if isinstance(msg.get("info"), dict) and msg["info"].get("module"):
+            versions = msg["info"]["module"]
+        if versions and "gcode_state" in state:
+            break
+    sock.close()
+    out(printer_info(state, versions))
+
+
+def cmd_unload():
+    """Unload the external spool (what Bambu Studio's Unload button sends for a printer without AMS)."""
+    host, serial, code, fp = env_printer()
+    if os.environ.get("BAMBU_CONFIRM") != "unload":
+        fail("unloading heats the nozzle and moves filament; set BAMBU_CONFIRM=unload to go ahead", 2)
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+    pushall(sock, serial)
+    state = {}
+    for msg in session_messages(sock, serial, 8):
+        if isinstance(msg.get("print"), dict):
+            merge(state, msg["print"])
+            if "gcode_state" in state:
+                break
+    if state.get("gcode_state") in ("RUNNING", "PREPARE", "PAUSE"):
+        fail("the printer is busy (%s); not unloading" % state.get("gcode_state"), 5)
+    vt = state.get("vt_tray") or {}
+    lo, hi = num(vt.get("nozzle_temp_min")), num(vt.get("nozzle_temp_max"))
+    # middle of the loaded filament's range (PLA 190-240 -> 215), 220 when the printer does not say
+    temp = int(5 * round(((lo + hi) / 2) / 5)) if lo and hi else 220
+    temp = max(190, min(temp, 260))
+    command = {"print": {"command": "ams_change_filament", "sequence_id": "1", "curr_temp": temp, "tar_temp": temp,
+                         "ams_id": 255, "target": 255, "slot_id": 255}}
+    publish(sock, "device/%s/request" % serial, command)
+    out({"sent": "ams_change_filament unload", "temp": temp, "filament": vt.get("tray_type")})
+    last = None
+    for msg in session_messages(sock, serial, 150):
+        p = msg.get("print") if isinstance(msg.get("print"), dict) else None
+        if not p:
+            continue
+        if p.get("command") == "ams_change_filament":
+            out({"reply": {k: p.get(k) for k in ("result", "reason", "errno") if k in p}})
+        merge(state, p)
+        view = {"stage": state.get("stg_cur"), "nozzle": round(num(state.get("nozzle_temper")) or 0), "target": state.get("nozzle_target_temper"),
+                "ams_status": state.get("ams_status"), "external_spool": (state.get("vt_tray") or {}).get("tray_type")}
+        if view != last:
+            out(view)
+            last = view
+    sock.close()
+
+
+def cmd_print():
+    """Start a sliced .gcode.3mf that is already on the printer's storage (upload it over FTPS first)."""
+    host, serial, code, fp = env_printer()
+    name = os.environ.get("BAMBU_FILE", "")
+    if not name or "/" in name:
+        fail("set BAMBU_FILE to the file name on the printer's storage", 2)
+    if os.environ.get("BAMBU_CONFIRM") != "print":
+        fail("starting a print moves the printer; make sure the plate is clear, then set BAMBU_CONFIRM=print", 2)
+    plate = int(os.environ.get("BAMBU_PLATE", "1"))
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+    pushall(sock, serial)
+    state = {}
+    for msg in session_messages(sock, serial, 8):
+        if isinstance(msg.get("print"), dict):
+            merge(state, msg["print"])
+            if "gcode_state" in state:
+                break
+    if state.get("gcode_state") in ("RUNNING", "PREPARE", "PAUSE", "SLICING"):
+        fail("the printer is busy (%s); not starting" % state.get("gcode_state"), 5)
+    url = os.environ.get("BAMBU_URL") or "file:///sdcard/" + name
+    task = name.replace(".gcode.3mf", "").replace(".3mf", "")
+    command = {"print": {
+        "sequence_id": "2", "command": "project_file", "param": "Metadata/plate_%d.gcode" % plate,
+        "project_id": "0", "profile_id": "0", "task_id": "0", "subtask_id": "0", "subtask_name": task,
+        "url": url, "md5": os.environ.get("BAMBU_MD5", ""), "timelapse": False, "bed_type": "auto",
+        "bed_leveling": True, "bed_levelling": True, "flow_cali": False, "vibration_cali": False,
+        "layer_inspect": False, "use_ams": False, "ams_mapping": ""}}
+    publish(sock, "device/%s/request" % serial, command)
+    out({"sent": "project_file", "url": url, "plate": plate})
+    last = None
+    for msg in session_messages(sock, serial, float(os.environ.get("BAMBU_WATCH_SECONDS", "90"))):
+        p = msg.get("print") if isinstance(msg.get("print"), dict) else None
+        if not p:
+            continue
+        if p.get("command") == "project_file":
+            out({"reply": {k: p.get(k) for k in ("result", "reason", "errno", "err_code") if k in p}})
+        merge(state, p)
+        view = {"state": state.get("gcode_state"), "stage": state.get("stg_cur"), "percent": state.get("mc_percent"),
+                "layer": state.get("layer_num"), "of": state.get("total_layer_num"), "file": state.get("subtask_name"),
+                "nozzle": round(num(state.get("nozzle_temper")) or 0), "bed": round(num(state.get("bed_temper")) or 0),
+                "error": state.get("print_error") or None}
+        if view != last:
+            out(view)
+            last = view
+    sock.close()
+
+
+def cmd_snapshot(path):
+    """One frame from the P1/A1 chamber camera (port 6000, needs LAN Mode Liveview on the printer)."""
+    host, serial, code, fp = env_printer()
+    try:
+        raw = socket.create_connection((host, 6000), timeout=TIMEOUT)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(raw)
+    except OSError as e:
+        fail("no camera answers at %s:6000 (%s)" % (host, e), 4)
+    if fp and hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest() != fp:
+        sock.close()
+        fail("a different device answers at %s (certificate changed)" % host, 3)
+    # the greeting: size 0x40, type 0x3000, two zeroes, then user and access code padded to 32 bytes
+    sock.sendall(struct.pack("<IIII", 0x40, 0x3000, 0, 0) + b"bblp".ljust(32, b"\x00") + code.encode()[:32].ljust(32, b"\x00"))
+    sock.settimeout(15)
+    try:
+        header = read_exact(sock, 16)
+        size = struct.unpack("<I", header[:4])[0]
+        if not 1000 < size < 5_000_000:
+            fail("unexpected camera frame size %d (is LAN Mode Liveview on?)" % size, 4)
+        frame = read_exact(sock, size)
+    except (OSError, ConnectionError) as e:
+        fail("camera sent no frame (%s); LAN Mode Liveview may be off" % e, 4)
+    finally:
+        sock.close()
+    if frame[:2] != b"\xff\xd8":
+        fail("camera frame is not a JPEG", 4)
+    with open(path, "wb") as f:
+        f.write(frame)
+    out({"saved": path, "bytes": len(frame)})
+
+
+def cmd_light(mode):
+    """Chamber light on or off (the camera sees nothing in a dark enclosure)."""
+    host, serial, code, fp = env_printer()
+    try:
+        sock = mqtt_session(host, serial, code, fp)
+    except PermissionError as e:
+        fail(str(e), 3)
+    except (OSError, ConnectionError, ValueError) as e:
+        fail("%s: %s" % (host, e), 4)
+    publish(sock, "device/%s/request" % serial, {"system": {"sequence_id": "3", "command": "ledctrl", "led_node": "chamber_light",
+            "led_mode": mode, "led_on_time": 500, "led_off_time": 500, "loop_times": 0, "interval_time": 0}})
+    reply = None
+    for msg in session_messages(sock, serial, 6):
+        sysmsg = msg.get("system") if isinstance(msg.get("system"), dict) else None
+        if sysmsg and sysmsg.get("command") == "ledctrl":
+            reply = sysmsg.get("result")
+            break
+    sock.close()
+    out({"light": mode, "reply": reply})
+
+
+def cmd_watch():
+    host, serial, code, fp = env_printer()
+    backoff = 2
+    last = None
+    while True:
+        try:
+            sock = mqtt_session(host, serial, code, fp)
+            backoff = 2
+            for p in reports(sock, serial):
+                st = status_from(p)
+                if st != last:
+                    out(st)
+                    last = st
+        except PermissionError as e:
+            out({"state": "offline", "message": str(e)})
+            last = None
+            time.sleep(BACKOFF_MAX)   # a refused code will not start working by retrying fast
+            continue
+        except (OSError, ConnectionError, ValueError) as e:
+            out({"state": "offline", "message": "No answer (%s)" % e})
+            last = None
+        time.sleep(backoff)
+        backoff = min(BACKOFF_MAX, backoff * 2)
+
+
+def cmd_discover(seconds):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind(("", 2021))
+    try:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY))
+    except OSError:
+        pass
+    s.settimeout(1)
+    seen = set()
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            data, addr = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        fields = {}
+        for line in data.decode(errors="replace").splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fields[k.strip().lower()] = v.strip()
+        serial = fields.get("usn", "")
+        if not serial or serial in seen:
+            continue
+        seen.add(serial)
+        out({"host": addr[0], "serial": serial, "name": fields.get("devname.bambu.com", ""),
+             "model": fields.get("devmodel.bambu.com", ""), "mode": fields.get("devconnect.bambu.com", "")})
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+    elif args[0] == "cert" and len(args) == 2:
+        cmd_cert(args[1])
+    elif args[0] == "check":
+        cmd_check()
+    elif args[0] == "info":
+        cmd_info()
+    elif args[0] == "unload":
+        cmd_unload()
+    elif args[0] == "print":
+        cmd_print()
+    elif args[0] == "light" and len(args) == 2 and args[1] in ("on", "off"):
+        cmd_light(args[1])
+    elif args[0] == "snapshot" and len(args) == 2:
+        cmd_snapshot(args[1])
+    elif args[0] == "watch":
+        try:
+            cmd_watch()
+        except KeyboardInterrupt:
+            pass
+    elif args[0] == "discover":
+        cmd_discover(float(args[1]) if len(args) > 1 else 10)
+    else:
+        fail("unknown command (maker-bambu --help)", 2)

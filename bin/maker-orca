@@ -1,0 +1,3232 @@
+#!/usr/bin/env python3
+"""maker-orca: use OrcaSlicer from the keyboard on Omarchy (standard library, plus grim, tesseract, wlrctl).
+
+On Wayland, Orca's page tabs and preset lists only answer the mouse. These commands find them on the
+screen (Tesseract reads the labels), click them for you, put the pointer back, and check in Orca's own
+settings that the choice took.
+
+    maker-orca page home|prepare|preview|device|project|calibration
+    maker-orca pick printer|filament|process|plate [--slot N] [--choose NAME]
+    maker-orca setup NAME        switch printer, filament, process and plate type in one go
+    maker-orca import FILE...    put models on the plate (opens Orca with them when Orca is closed;
+                                 --if-running: exit 3 instead, --quiet: no notification when it worked;
+                                 exit 4 when Orca asks something first)
+    maker-orca open              pick a recent model (Meshy, Downloads, 3D_Exports, Orca's recent) to import
+    maker-orca meshy             make a model with Meshy: describe it, or give pictures
+    maker-orca plate next|prev   select the next or previous plate (through Preview's plate list)
+    maker-orca prep              get the plate ready for a test print: lay the model down, infill no higher than
+                                 10% in a pattern we print, no brim, tree supports only when Orca asks for them,
+                                 then slice (--infill N, --no-orient; nothing is saved over a preset)
+    maker-orca prep --revert     put those four settings back to what the preset says (Orca's undo does not)
+    maker-orca speeds            a touch off every printing speed, a little more off the bridges, and a touch
+                                 back onto the overhangs (--revert puts them back; nothing is saved to a preset)
+    maker-orca dismiss           close the pop-up Orca has in front (Esc does this itself; the Esc binding calls it
+                                 when Orca's main window holds the focus while a pop-up is still up)
+    maker-orca clear [--yes]     take everything off every plate (Orca's Ctrl+Z puts it back)
+    maker-orca kit               cut a model into parts that slot together, then lay them out on the plate
+                                 (Blender does the cutting; pictures of every part are written beside them)
+    maker-orca selfcheck         check the Orca keys against the running Orca (needs an empty plate; changes nothing)
+    maker-orca print [PRINTER]   open Orca's print window (slicing first if needed) and pick the printer;
+                                 you check the plate and press Send
+    maker-orca menu              one Omarchy menu with every page, action, setup and preset
+    maker-orca setups            print the setups (~/.config/omarchy-maker/orca-setups.json)
+    maker-orca hint [off]        show the Orca keys for 20 seconds (off takes the note down)
+    maker-orca keys              print the Orca keys
+
+The Hyprland bindings in hypr/maker.lua call these: Control + Alt + one key, with Orca (Control + Option on
+an Apple keyboard). Orca's own shortcuts never use Ctrl+Alt, so nothing here gets in their way.
+"""
+import datetime, difflib, fcntl, glob, json, os, re, shutil, struct, subprocess, sys, threading, time
+
+ORCA_CLASS = "orca-slicer"
+ORCA_CONFIG = os.path.expanduser(os.environ.get("ORCA_CONFIG_DIR", "~/.config/OrcaSlicer"))
+MAKER_HOME = os.environ.get("MAKER_HOME") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "omarchy-maker")
+
+# Where things sit in Orca 2.4's window, in logical pixels (measured on Omarchy 4, Orca 2.4.2).
+TAB_ROW_Y = 54                 # centre of the page tabs
+HOME_TAB_X = 24                # the Home tab is an icon: always first, 48 wide
+BOX_BELOW_HEADING = {"printer": 57, "plate": 57, "filament": 44, "process": 43}
+BOX_X = {"printer": 160, "plate": 422, "process": 215}
+BOX_LEFT = {"printer": 66, "plate": 388, "process": 38}      # left edge of each box (its list opens there)
+# the two filament columns: box left edge, click x, and x through the left part of the slot number badge
+FILAMENT_COLUMNS = ({"left": 38, "click": 120, "badge": 16}, {"left": 260, "click": 345, "badge": 238})
+ROW_STEP = 28                  # rows in Orca's lists
+PAGES = ("home", "prepare", "preview", "device", "project", "calibration")
+PLATE_TYPES = ("Smooth Cool Plate", "Engineering Plate", "Smooth High Temp Plate", "Textured PEI Plate",
+               "Textured Cool Plate", "Cool Plate (SuperTack)")   # Orca's BedType 1..6, in list order
+
+KEYS = """Orca keys: hold Control + Alt (Control + Option on an Apple keyboard) and press one key, with Orca
+in front. Orca's own shortcuts never use Ctrl+Alt, so the two never mix: m, r, s, f, 1-9 are Orca's. Two are
+enough to remember: Ctrl+Alt+O brings Orca from anywhere, and Ctrl+Alt+Space lists everything else in words.
+  Ctrl+Alt+O      OrcaSlicer: open it, or bring it forward (from anywhere)
+  Ctrl+Alt+Space  everything, in one menu (type to find it): pages, presets, setups, Blender, OpenSCAD, Bambu
+  Ctrl+Alt+1..6   Home  Prepare  Preview  Device  Project  Calibration
+  Ctrl+Alt+I      put a model on the plate (your Meshy models, Downloads, 3D_Exports, Orca's recent projects)
+  Ctrl+Alt+M      make a model with Meshy
+  Ctrl+Alt+P      printer, or a whole setup
+  Ctrl+Alt+F      filament preset            Ctrl+Alt+S  process preset (the slicing profile)
+  Ctrl+Alt+B      bed: the plate type
+  Ctrl+Alt+G      print: Orca's print window, pick the printer (you press Send)
+  Ctrl+Alt+T      get the plate ready for a test print (lay it down, 10% infill, no brim, supports if Orca asks)
+  Ctrl+Alt+K      cut a model into parts that slot together, all of them onto the plate
+  Ctrl+Alt+V      speeds: a touch slower, bridges slower still, overhangs a touch quicker
+  Ctrl+Alt+[ / Ctrl+Alt+]   previous / next plate
+  Ctrl+Alt+H      show these keys
+  Esc             closes the pop-up in front (Orca's own key; handed to the pop-up when the main window has the focus)
+Orca's own, nothing added: Ctrl+R slice, Ctrl+Shift+G print, Ctrl+G export, Ctrl+P preferences, Ctrl+I import a
+file, Tab Prepare/Preview, A arrange, Q orient, ? lists all of them"""
+
+# the notification behind Ctrl+Alt+H: Omarchy collapses spaces and shows a few short lines
+HINT = """Ctrl+Alt with Orca · Space menu · 1-6 pages
+I model in · M Meshy · P printer · F filament
+S process · B bed · T test prep · G print
+K parts · V speeds · [ ] plates · H these keys
+Esc closes the pop-up · Ctrl+R slices (Orca's own)"""
+
+
+class Stop(Exception):
+    """Something the user should hear about; ends the command."""
+
+
+# ------------------------------------------------------------------------------------------ desktop
+def session_env():
+    env = dict(os.environ)
+    uid = os.getuid()
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % uid)
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        found = sorted(glob.glob(os.path.join(env["XDG_RUNTIME_DIR"], "hypr", "*")), key=os.path.getmtime)
+        if found:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(found[-1])
+    if not env.get("WAYLAND_DISPLAY"):
+        sockets = sorted(glob.glob(os.path.join(env["XDG_RUNTIME_DIR"], "wayland-[0-9]")))
+        if sockets:
+            env["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    return env
+
+
+ENV = session_env()
+
+
+def run(args, data=None, timeout=30, check=True):
+    proc = subprocess.run(args, input=data, capture_output=True, env=ENV, timeout=timeout)
+    if check and proc.returncode != 0:
+        raise Stop("%s failed: %s" % (os.path.basename(args[0]), proc.stderr.decode(errors="replace").strip()[:200]))
+    return proc.stdout
+
+
+def hyprctl_json(*what):
+    return json.loads(run(["hyprctl", "-j"] + list(what)))
+
+
+def lua(code):
+    run(["hyprctl", "eval", code])
+
+
+def tool(name):
+    # omarchy-maker's own wlrctl first: it carries the `wheel` action Orca's lists need
+    for candidate in (os.path.join(MAKER_HOME, "bin", name), shutil.which(name, path=ENV.get("PATH"))):
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    raise Stop({"wlrctl": "wlrctl is missing (it clicks for the Orca keys): run maker doctor",
+                "tesseract": "Tesseract is missing: sudo pacman -S tesseract tesseract-data-eng",
+                "grim": "grim is missing: sudo pacman -S grim"}.get(name, "%s is missing" % name))
+
+
+def orca_windows():
+    return [c for c in hyprctl_json("clients") if c.get("class") == ORCA_CLASS]
+
+
+def orca_main(windows=None):
+    """Orca's main window: the one whose title ends with "- OrcaSlicer", even when it floats (Omarchy's
+    pop-window-out floats it), or else the biggest one. None when Orca is not open."""
+    windows = orca_windows() if windows is None else windows
+    named = [w for w in windows if (w.get("title") or "").endswith("- OrcaSlicer")] or windows
+    return max(named, key=lambda w: w["size"][0] * w["size"][1]) if named else None
+
+
+def orca_dialogs(windows=None):
+    """Orca's other windows: what it is asking or loading, told apart by being not the main window."""
+    windows = orca_windows() if windows is None else windows
+    main = orca_main(windows)
+    return [w for w in windows if not main or w["address"] != main["address"]]
+
+
+def orca_window():
+    windows = orca_windows()
+    main = orca_main(windows)
+    if not main:
+        raise Stop("OrcaSlicer is not open")
+    dialogs = [w.get("title") or "a dialog" for w in orca_dialogs(windows)]
+    if dialogs:
+        raise Stop("Orca is showing %s; answer it first" % ", ".join(repr(d) for d in dialogs))
+    return main
+
+
+def focus(win):
+    active = hyprctl_json("activewindow")
+    if active.get("address") != win["address"]:
+        lua('for _, w in ipairs(hl.get_windows()) do if w.address == "%s" then hl.dispatch(hl.dsp.focus({ window = w })) end end'
+            % win["address"])
+        time.sleep(0.4)
+
+
+def cursor():
+    x, y = run(["hyprctl", "cursorpos"]).decode().split(",")
+    return int(float(x)), int(float(y))
+
+
+def move_cursor(x, y):
+    lua("hl.dispatch(hl.dsp.cursor.move({ x = %d, y = %d }))" % (x, y))
+
+
+def covered(win, x, y):
+    """A floating window of another app over this point would take the click."""
+    for c in hyprctl_json("clients"):
+        if c.get("address") == win["address"] or not c.get("floating") or c["workspace"]["id"] != win["workspace"]["id"]:
+            continue
+        cx, cy = c["at"]
+        cw, ch = c["size"]
+        if cx <= x < cx + cw and cy <= y < cy + ch:
+            return c.get("class") or c.get("title")
+    return None
+
+
+def click(win, dx, dy, settle=0.05):
+    """Left click at a point inside Orca's window (window coordinates), after a little real motion."""
+    x, y = win["at"][0] + int(dx), win["at"][1] + int(dy)
+    if not (0 <= dx < win["size"][0] and 0 <= dy < win["size"][1]):
+        raise Stop("that spot is outside Orca's window")
+    other = covered(win, x, y)
+    if other:
+        raise Stop("%s is covering Orca" % other)
+    wlrctl = tool("wlrctl")
+    PARKED[0] = False
+    move_cursor(x, y)
+    time.sleep(settle)
+    run([wlrctl, "pointer", "move", "2", "0"])      # GTK wants real motion before a click
+    time.sleep(settle)
+    run([wlrctl, "pointer", "move", "-2", "0"])
+    time.sleep(settle * 1.25)
+    run([wlrctl, "pointer", "click", "left"])
+
+
+def wheel(win, dx, dy, notches):
+    """Mouse-wheel notches at a point (negative scrolls up). Orca's lists ignore smooth touchpad scrolling."""
+    PARKED[0] = False
+    x, y = win["at"][0] + int(dx), win["at"][1] + int(dy)
+    move_cursor(x, y)
+    time.sleep(0.08)                                  # let the pointer arrive, or the first notch goes elsewhere
+    proc = subprocess.run([tool("wlrctl"), "pointer", "wheel", str(notches)], capture_output=True, env=ENV, timeout=30)
+    if proc.returncode != 0:
+        raise Stop("this wlrctl can't turn the mouse wheel; run maker doctor")
+
+
+def notify(headline, text="", seconds=4, image=None, replace=None):
+    """A toast. Returns its id, which replace= takes to update that toast in place."""
+    toast = None
+    if shutil.which("omarchy-notification-send", path=ENV.get("PATH")):
+        args = ["omarchy-notification-send", "-g", "\U000f042b", "-t", str(seconds * 1000)]
+        args += ["-r", str(replace)] if replace else ["-p"]
+        out = run(args + (["--image", image] if image else []) + [headline, text], check=False).decode().strip()
+        toast = out if out.isdigit() else None
+    elif shutil.which("notify-send", path=ENV.get("PATH")):
+        run(["notify-send", "-t", str(seconds * 1000), headline, text], check=False)
+    print(("%s: %s" % (headline, text)) if text else headline, flush=True)
+    return toast
+
+
+# -------------------------------------------------------------------------------------------- reading
+# Orca's labels are light on dark grey, or on green when selected. Keeping only bright red-channel pixels
+# turns every label black on white, whatever sits behind it (Orca's own green has no red at all).
+LIGHT_TEXT = bytes(0 if v > 128 else 255 for v in range(256))
+
+
+class Shot:
+    """A screen capture of part of Orca's window: pixels plus the window coordinates it covers."""
+
+    def __init__(self, win, dx, dy, w, h):
+        w = max(1, min(int(w), win["size"][0] - int(dx)))
+        h = max(1, min(int(h), win["size"][1] - int(dy)))
+        self.dx, self.dy, self.w, self.h = int(dx), int(dy), w, h
+        data = run([tool("grim"), "-t", "ppm", "-g", "%d,%d %dx%d" % (win["at"][0] + dx, win["at"][1] + dy, w, h), "-"])
+        header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\s", data)
+        if not header:
+            raise Stop("grim returned an image this tool can't read")
+        self.pw, self.ph = int(header.group(1)), int(header.group(2))
+        self.scale = self.pw / float(w)
+        self.pixels = data[header.end():]
+
+    def pixel(self, dx, dy):
+        """(r, g, b) at a window coordinate inside the capture."""
+        px = min(self.pw - 1, max(0, int((dx - self.dx) * self.scale)))
+        py = min(self.ph - 1, max(0, int((dy - self.dy) * self.scale)))
+        i = (py * self.pw + px) * 3
+        return tuple(self.pixels[i:i + 3])
+
+    def words(self, box=None, psm=11, min_conf=20, threshold=128, blank=None, big=False):
+        """Tesseract's words in window coordinates, for the whole capture or a box (dx, dy, w, h) inside it.
+        `threshold` says how faint text may be: Orca greys out the settings that do not apply right now, and
+        those only come out below about 95."""
+        gray = self.pixels[0::3]
+        px0, py0, px1, py1 = 0, 0, self.pw, self.ph
+        if box:
+            bx, by, bw, bh = box
+            px0, py0 = max(0, int((bx - self.dx) * self.scale)), max(0, int((by - self.dy) * self.scale))
+            px1, py1 = min(self.pw, int((bx + bw - self.dx) * self.scale)), min(self.ph, int((by + bh - self.dy) * self.scale))
+            if px1 <= px0 or py1 <= py0:
+                return []
+            gray = b"".join(gray[row * self.pw + px0:row * self.pw + px1] for row in range(py0, py1))
+        ink = LIGHT_TEXT if threshold == 128 else bytes(0 if v > threshold else 255 for v in range(256))
+        body = gray.translate(ink)
+        if blank:                                     # paint something out before Tesseract sees it
+            wide = px1 - px0
+            bx0 = max(0, min(wide, int((blank[0] - self.dx) * self.scale) - px0))
+            bx1 = max(0, min(wide, int((blank[1] - self.dx) * self.scale) - px0))
+            if bx1 > bx0:
+                rows = [body[row * wide:(row + 1) * wide] for row in range(py1 - py0)]
+                body = b"".join(row[:bx0] + row[bx0:bx1].translate(bytes([row[0]] * 256)) + row[bx1:]
+                                for row in rows)
+        wide, tall, scale = px1 - px0, py1 - py0, self.scale
+        if big:                                       # two 1s side by side come back as one at this size
+            body = b"".join(bytes(v for px in body[row * wide:(row + 1) * wide] for v in (px, px)) * 2
+                            for row in range(tall))
+            wide, tall, scale = wide * 2, tall * 2, scale * 2
+        image = b"P5\n%d %d\n255\n" % (wide, tall) + body
+        tsv = run([tool("tesseract"), "stdin", "stdout", "--oem", "1", "--psm", str(psm), "-l", "eng", "tsv"], data=image).decode()
+        return parse_tsv(tsv, self.dx + px0 / self.scale, self.dy + py0 / self.scale, scale, min_conf)
+
+
+def parse_tsv(tsv, dx=0, dy=0, scale=1.0, min_conf=20):
+    words = []
+    for row in tsv.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) < 12 or cols[0] != "5" or not cols[11].strip():
+            continue
+        left, top, width, height, conf = (float(v) for v in cols[6:11])
+        if conf < min_conf:
+            continue
+        words.append({"text": cols[11].strip(), "x": dx + left / scale, "y": dy + top / scale,
+                      "w": width / scale, "h": height / scale, "conf": conf})
+    return words
+
+
+def lines(words, gap=28):
+    """Group words into lines: first by height band, then split a band wherever neighbours are further than `gap` apart."""
+    bands = []
+    for word in sorted(words, key=lambda w: w["y"] + w["h"] / 2):
+        middle = word["y"] + word["h"] / 2
+        if bands and abs(bands[-1]["middle"] - middle) <= max(5, word["h"] * 0.6):
+            band = bands[-1]
+            band["words"].append(word)
+            band["middle"] = sum(w["y"] + w["h"] / 2 for w in band["words"]) / len(band["words"])
+        else:
+            bands.append({"middle": middle, "words": [word]})
+
+    def line(ws):
+        return {"text": " ".join(w["text"] for w in ws), "x": ws[0]["x"], "right": ws[-1]["x"] + ws[-1]["w"],
+                "y": sum(w["y"] + w["h"] / 2 for w in ws) / len(ws)}
+
+    out = []
+    for band in bands:
+        current = []
+        for word in sorted(band["words"], key=lambda w: w["x"]):
+            if current and word["x"] - (current[-1]["x"] + current[-1]["w"]) > gap:
+                out.append(line(current))
+                current = []
+            current.append(word)
+        out.append(line(current))
+    return sorted(out, key=lambda l: (l["y"], l["x"]))
+
+
+CONFUSABLE = str.maketrans({"l": "1", "i": "1", "|": "1", "!": "1", "o": "0"})
+
+
+def squash(text):
+    return re.sub(r"[^0-9a-z@+%()]", "", text.lower()).translate(CONFUSABLE)
+
+
+class Names:
+    """Preset names, looked up by what Tesseract read. Exact and squashed hits are instant; only a miss
+    compares against similar names (same first letter, similar length)."""
+
+    def __init__(self, names):
+        self.names = list(names)
+        self.exact = set(self.names)
+        self.by_squash = {}
+        for name in self.names:
+            self.by_squash.setdefault(squash(name), []).append(name)
+
+    def __contains__(self, name):
+        return name in self.exact
+
+    def __iter__(self):
+        return iter(self.names)
+
+    def match(self, text, cutoff=0.84):
+        if text in self.exact:
+            return text
+        seen = squash(text)
+        if not seen:
+            return None
+        same = self.by_squash.get(seen)
+        if same:
+            # ties (Orca ships both "Bambu PLA" and "Bambu pla") go to the name closest to what was read
+            return max(same, key=lambda n: difflib.SequenceMatcher(None, text, n).ratio())
+        scored = []
+        for key, names in self.by_squash.items():
+            if key[:1] != seen[:1] or not 0.6 <= len(key) / len(seen) <= 1.6:
+                continue
+            ratio = difflib.SequenceMatcher(None, seen, key).ratio()
+            if ratio >= cutoff - 0.06:
+                scored.extend((ratio, difflib.SequenceMatcher(None, text, n).ratio(), n) for n in names)
+        scored.sort(reverse=True)
+        if not scored or scored[0][0] < cutoff:
+            return None
+        if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.06 and squash(scored[0][2]) != squash(scored[1][2]):
+            return None
+        return scored[0][2]
+
+
+def best_match(text, names, cutoff=0.84):
+    """The name OCR most likely saw, or None when it is not clearly one of them."""
+    return (names if isinstance(names, Names) else Names(names)).match(text, cutoff)
+
+
+# ------------------------------------------------------------------------------------------------ memory
+LAYOUT = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-maker", "orca-layout.json")
+
+
+def load_layout():
+    try:
+        data = json.load(open(LAYOUT))
+    except (OSError, ValueError):
+        data = {}
+    for section in ("tabs", "headings", "lists", "panel"):
+        data.setdefault(section, {})
+    return data
+
+
+def save_layout(data):
+    os.makedirs(os.path.dirname(LAYOUT), exist_ok=True)
+    tmp = LAYOUT + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle)
+    os.replace(tmp, LAYOUT)
+
+
+def size_key(win):
+    return "%dx%d" % tuple(win["size"])
+
+
+def forget_lists():
+    data = load_layout()
+    data["lists"] = {}
+    save_layout(data)
+
+
+# ------------------------------------------------------------------------------------------------ pages
+def find_tabs(words):
+    """Page name -> x centre, from the tab labels Tesseract read."""
+    tabs = {"home": HOME_TAB_X}
+    for word in words:
+        name = best_match(word["text"], [p.capitalize() for p in PAGES[1:]], cutoff=0.8)
+        if name:
+            tabs.setdefault(name.lower(), word["x"] + word["w"] / 2)
+    return tabs
+
+
+def read_tabs(win):
+    shot = Shot(win, 0, TAB_ROW_Y - 20, min(win["size"][0], 1300), 40)
+    return shot, find_tabs(shot.words())
+
+
+def selected_page(shot, tabs):
+    for name, x in tabs.items():
+        r, g, b = shot.pixel(x if name == "home" else x - 50, TAB_ROW_Y - 16)
+        if g > r + 40 and g > 70:              # the selected tab is Orca green
+            return name
+    return None
+
+
+def quiet_spot(shot, tabs):
+    """x of bare tab bar right of the last tab. Clicking there closes an open list and does nothing else,
+    whether or not the click also reaches the tab bar."""
+    start = int(max(tabs.values()) + 100)
+    bg = shot.pixel(start, TAB_ROW_Y)
+    run_start = None
+    for x in range(start, shot.dx + shot.w - 1):
+        plain = all(sum(abs(a - b) for a, b in zip(shot.pixel(x, y), bg)) < 12 for y in (TAB_ROW_Y - 12, TAB_ROW_Y, TAB_ROW_Y + 12))
+        if not plain:
+            run_start = None
+        elif run_start is None:
+            run_start = x
+        elif x - run_start >= 40:
+            return run_start + 20
+    return None
+
+
+def tab_strip(win):
+    return Shot(win, 0, TAB_ROW_Y - 20, min(win["size"][0], 1300), 40)
+
+
+def tabs_for(win, refresh=False):
+    """Tab positions and a bare spot on the tab bar, remembered per window size (read once with Tesseract)."""
+    data = load_layout()
+    key = size_key(win)
+    if not refresh and key in data["tabs"]:
+        return data["tabs"][key]
+    shot, tabs = read_tabs(win)
+    if not {"prepare", "preview", "device"} <= set(tabs):
+        raise Stop("can't see Orca's tab names (is the window wide enough?)")
+    tabs["quiet_x"] = quiet_spot(shot, tabs)
+    data["tabs"][key] = tabs
+    save_layout(data)
+    return tabs
+
+
+def wait_for(test, timeout, step=0.06):
+    deadline = time.time() + timeout
+    while True:
+        result = test()
+        if result or time.time() >= deadline:
+            return result
+        time.sleep(step)
+
+
+def go_to_page(win, page):
+    for refresh in (False, True):
+        tabs = tabs_for(win, refresh)
+        if page not in tabs:
+            continue
+        pages = {k: v for k, v in tabs.items() if k in PAGES}
+        if selected_page(tab_strip(win), pages) == page:
+            return
+        click(win, tabs[page], TAB_ROW_Y, settle=0.06)
+        if wait_for(lambda: selected_page(tab_strip(win), pages) == page, 1.2):
+            return
+        if [c for c in hyprctl_json("clients") if c.get("class") == ORCA_CLASS and c.get("floating")]:
+            raise Stop("Orca is asking something before it switches page; answer it in Orca")
+    raise Stop("couldn't switch Orca to %s" % page.capitalize())
+
+
+# ------------------------------------------------------------------------------------------------ presets
+def find_headings(words):
+    """y centre of the sidebar headings Printer / Filament / Process."""
+    found = {}
+    for word in words:
+        if word["x"] > 90:
+            continue
+        name = best_match(word["text"], ["Printer", "Filament", "Process"], cutoff=0.8)
+        if name:
+            found.setdefault(name.lower(), word["y"] + word["h"] / 2)
+    return found
+
+
+def read_sidebar(win):
+    return Shot(win, 0, 80, 480, min(420, win["size"][1] - 80)).words()
+
+
+PRINTER_SECTION_OPEN = 80       # Printer heading to Filament heading, in pixels, when the Printer section is open
+
+
+BAND_X = 240                   # x through the sidebar where section heading bands show and boxes do not
+
+
+def headings_look_right(win, headings):
+    """Each remembered heading still sits on a heading band (lighter grey), with plain sidebar below it."""
+    shot = Shot(win, BAND_X - 2, 80, 4, min(420, win["size"][1] - 80))
+
+    def grey(y):
+        r, g, b = shot.pixel(BAND_X, y)
+        return r, max(r, g, b) - min(r, g, b)
+
+    for y in headings.values():
+        band, spread = grey(y)
+        below, spread_below = grey(y + 26)
+        if not (50 <= band <= 72 and spread <= 10 and below < 50):
+            return False
+    return True
+
+
+def sidebar(win):
+    """Headings (remembered per window size and checked against the screen), switching to Prepare when the
+    sidebar is not showing."""
+    data = load_layout()
+    key = size_key(win)
+    remembered = data["headings"].get(key) or []
+    if isinstance(remembered, dict):
+        remembered = [remembered]
+    for layout in remembered:                         # printers with more filaments push Process further down
+        if headings_look_right(win, layout):
+            return layout
+    headings = find_headings(read_sidebar(win))
+    if len(headings) < 3:
+        tabs = tabs_for(win)
+        pages = {k: v for k, v in tabs.items() if k in PAGES}
+        if selected_page(tab_strip(win), pages) not in ("prepare", "preview"):
+            go_to_page(win, "prepare")
+            time.sleep(0.6)
+            headings = find_headings(read_sidebar(win))
+    if len(headings) < 3:
+        raise Stop("can't see Orca's Printer, Filament and Process settings (press Shift+Tab in Orca if the sidebar is hidden)")
+    data = load_layout()
+    layouts = [l for l in (data["headings"].get(key) or []) if isinstance(l, dict) and l != headings]
+    data["headings"][key] = ([headings] + layouts)[:6]
+    save_layout(data)
+    return headings
+
+
+def filament_slots(win, headings):
+    """Slot number -> (click x, y). Every slot has a solid badge in its filament's colour left of its box;
+    find those runs of non-background pixels (Tesseract can't read a name pressed against a white badge)."""
+    top, bottom = int(headings["filament"] + 20), int(headings["process"] - 16)
+    shot = Shot(win, 0, top, 480, bottom - top)
+    bg = shot.pixel(5, (top + bottom) // 2)
+    found = []
+    for column, spec in enumerate(FILAMENT_COLUMNS):
+        start = None
+        for y in range(top, bottom + 1):
+            r, g, b = shot.pixel(spec["badge"], y)
+            on = y < bottom and abs(r - bg[0]) + abs(g - bg[1]) + abs(b - bg[2]) > 60
+            if on and start is None:
+                start = y
+            elif not on and start is not None:
+                if y - start >= 10:
+                    found.append(((start + y) / 2, column))
+                start = None
+    rows = []
+    for middle, _column in sorted(found):
+        if not rows or middle - rows[-1] > 10:
+            rows.append(middle)
+    slots = {}
+    for middle, column in found:
+        row = min(range(len(rows)), key=lambda i: abs(rows[i] - middle))
+        slots[row * 2 + column + 1] = (FILAMENT_COLUMNS[column]["click"], middle)
+    return dict(sorted(slots.items()))
+
+
+def preset_names(kind):
+    folder = {"printer": "machine", "filament": "filament", "process": "process"}[kind]
+    names = set()
+    for pattern in ("user/*/%s/*.json", "user/*/%s/base/*.json", "system/*/%s/*.json"):
+        names.update(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(ORCA_CONFIG, pattern % folder)))
+    return names
+
+
+def current_selection(kind, slot=1):
+    """What Orca has selected right now, from its settings file (saved within a second of every change)."""
+    try:
+        conf = json.load(open(os.path.join(ORCA_CONFIG, "OrcaSlicer.conf")))
+    except (OSError, ValueError):
+        return None
+    machine = (conf.get("presets") or {}).get("machine")
+    if kind == "printer":
+        return machine
+    entry = next((e for e in conf.get("orca_presets") or [] if isinstance(e, dict) and e.get("machine") == machine), {})
+    if kind == "filament":
+        return entry.get("filament" if slot == 1 else "filament_%02d" % (slot - 1))
+    if kind == "plate":
+        code = entry.get("curr_bed_type")
+        return PLATE_TYPES[int(code) - 1] if code and code.isdigit() and 1 <= int(code) <= len(PLATE_TYPES) else None
+    return None
+
+
+class OrcaLog:
+    """Orca logs 'export_selections: printer X, print Y, filaments[0] Z' whenever a selection is saved."""
+
+    PATTERN = re.compile(r"export_selections: printer (.*?), print (.*?), filaments\[0\] ")
+
+    def __init__(self):
+        logs = sorted(glob.glob(os.path.join(ORCA_CONFIG, "log", "debug_*.log*")), key=os.path.getmtime)
+        self.path = logs[-1] if logs else None
+        self.offset = os.path.getsize(self.path) if self.path else 0
+
+    def contains(self, text):
+        """Orca wrote this since the log was opened."""
+        if not self.path:
+            return False
+        with open(self.path, "rb") as handle:
+            handle.seek(self.offset)
+            return text.encode() in handle.read()
+
+    @classmethod
+    def recent(cls, pattern, size=4_000_000):
+        """Every match of a bytes regular expression in the last few megabytes of Orca's newest log."""
+        log = cls()
+        if not log.path:
+            return []
+        with open(log.path, "rb") as handle:
+            handle.seek(max(0, os.path.getsize(log.path) - size))
+            return re.findall(pattern, handle.read())
+
+    def last(self, pattern):
+        """The last match of a regular expression Orca logged since the log was opened, or None."""
+        if not self.path:
+            return None
+        with open(self.path, "rb") as handle:
+            handle.seek(self.offset)
+            found = list(re.finditer(pattern, handle.read().decode(errors="replace")))
+        return found[-1] if found else None
+
+    def mark(self):
+        self.offset = os.path.getsize(self.path) if self.path else 0
+
+    def latest_process(self, since_start=False):
+        if not self.path:
+            return None
+        with open(self.path, "rb") as handle:
+            handle.seek(self.offset if since_start else max(0, os.path.getsize(self.path) - 4_000_000))
+            found = self.PATTERN.findall(handle.read().decode(errors="replace"))
+        return found[-1][1].strip() if found else None
+
+
+def current_process():
+    return OrcaLog().latest_process()
+
+
+def classify(text, y):
+    """(kind, text, y) for one row of an open Orca list: item, header, action or submenu."""
+    clean = text.strip(" |—-_~")
+    if re.match(r"^(user|system|project|custom|unsupported)\s+preset|^ams\s+filament", text, re.I):
+        return ("header", clean.split(" —")[0].strip(), y)
+    if text.startswith(("--", "—", "- -")):
+        return ("action", clean, y)
+    if text.endswith((">", "›")):
+        return ("submenu", clean.rstrip(">› "), y)
+    return ("item", clean, y)
+
+
+def list_entries(line_list, column):
+    """The rows of an open Orca list, top to bottom: rows start at `column` and sit ROW_STEP apart (a gap of a
+    few rows is rows Tesseract skipped, filled in later), and "-- Add/Remove ... --" rows end a list. Lines
+    without two letters or digits in a row are specks of border or rule, and any other spacing is sidebar
+    text past the list: the longest well-spaced run of rows is the list."""
+    blocks, block = [], []
+    for row in (l for l in line_list if abs(l["x"] - column) <= 12 and re.search(r"[A-Za-z0-9]{2}", l["text"])):
+        entry = classify(row["text"], row["y"])
+        if block:
+            gap = row["y"] - block[-1][2]
+            rows_apart = round(gap / ROW_STEP)
+            spaced = 1 <= rows_apart <= 4 and abs(gap - rows_apart * ROW_STEP) <= 6
+            if not spaced or (block[-1][0] == "action" and entry[0] != "action"):
+                blocks.append(block)
+                block = []
+        block.append(entry)
+    if block:
+        blocks.append(block)
+    return max(blocks, key=len) if blocks else []
+
+
+def fill_missing(shot, entries, column):
+    """Tesseract skips the odd row in a page of text; read each missing row on its own. A lone row is read
+    at any confidence (it gives "ASA 0.2" 10 out of 100 while reading it right); its text still has to match
+    a preset on disk before anyone sees it."""
+    filled = []
+    for entry in entries:
+        if filled:
+            for _n in range(round((entry[2] - filled[-1][2]) / ROW_STEP) - 1):
+                y = filled[-1][2] + ROW_STEP
+                row = lines(shot.words(box=(column - 6, y - 13, 330, 26), psm=7, min_conf=0))
+                filled.append(classify(row[0]["text"], y) if row else ("unread", "", y))
+        filled.append(entry)
+    return filled
+
+
+def list_column(line_list, box_left):
+    """x where the open list's text starts: the most common line start just right of the box's left edge."""
+    starts = [round(l["x"]) for l in line_list if box_left + 5 <= l["x"] <= box_left + 60]
+    if not starts:
+        return None
+    return max(set(starts), key=lambda s: sum(1 for x in starts if abs(x - s) <= 4))
+
+
+class OrcaList:
+    """One of Orca's preset lists, opened by clicking its box. Use it as a context manager.
+
+    What Orca 2.4 on Wayland does with these lists, and what this class does about it:
+    - Any tooltip appearing closes the list, and GTK shows one after the pointer rests for half a second
+      over the list or its box: while the list is open the pointer keeps moving a pixel back and forth.
+    - A vendor group row (Bambu >, Generic >) opens a submenu on hover, and a submenu that closes the wrong
+      way leaves the list half-dead until Orca restarts: the pointer only ever rests on ordinary rows, which
+      also makes Orca drop any stale submenu, and vendor submenus are not offered.
+    - Clicking the box again closes the list but leaves the box ignoring clicks, and a click on a sidebar
+      heading can fold that section: a click on bare tab bar closes the list instead.
+    - Lists ignore smooth scrolling: mouse-wheel notches through the patched wlrctl.
+    Whether the list is open is told from pixels under the box (sidebar vs list), not by reading text."""
+
+    def __init__(self, win, kind, box, box_left, quiet_x, known, column=None):
+        self.win, self.kind, self.box, self.box_left, self.quiet_x = win, kind, box, box_left, quiet_x
+        self.known = known if isinstance(known, Names) else Names(known)
+        self.column, self.closed = column, True
+        self._stop, self._hold, self._thread = threading.Event(), threading.Lock(), None
+        self._baseline = None
+
+    # ---- pointer
+    def _wiggle(self):
+        wlrctl, step = tool("wlrctl"), 1
+        while not self._stop.is_set():
+            with self._hold:
+                subprocess.run([wlrctl, "pointer", "move", str(step), "0"], env=ENV, capture_output=True, timeout=10)
+            step = -step
+            self._stop.wait(0.12)
+
+    def _still(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+            self._thread = None
+
+    def _click(self, dx, dy):
+        """A click with no motion between press and release (a moved press scrolls the list instead), after a
+        nudge each way so the list under the pointer has seen it arrive."""
+        wlrctl = tool("wlrctl")
+        with self._hold:
+            move_cursor(self.win["at"][0] + int(dx), self.win["at"][1] + int(dy))
+            for step in ("2", "-2"):
+                time.sleep(0.05)
+                run([wlrctl, "pointer", "move", step, "0"])
+            time.sleep(0.08)
+            run([wlrctl, "pointer", "click", "left"])
+
+    def rest_at(self, y):
+        with self._hold:
+            move_cursor(self.win["at"][0] + (self.column or self.box_left + 25) + 60, self.win["at"][1] + int(y))
+
+    # ---- open, closed
+    def _probe(self):
+        shot = Shot(self.win, self.box_left + 4, self.box[1] + 22, 70, 90)
+        return shot.pixels[::41]
+
+    def _differs(self):
+        now = self._probe()
+        return sum(1 for a, b in zip(now, self._baseline) if abs(a - b) > 30) > 12
+
+    def __enter__(self):
+        # a box's tooltip still showing (the pointer resting on it) would close the list as it opens: take
+        # the pointer to bare tab bar first, which hides it
+        move_cursor(self.win["at"][0] + self.quiet_x, self.win["at"][1] + TAB_ROW_Y)
+        time.sleep(0.15)
+        self._baseline = self._probe()
+        for attempt in range(3):
+            click(self.win, *self.box)
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._wiggle, daemon=True)
+            self._thread.start()
+            if wait_for(self._differs, 1.2):
+                time.sleep(0.12)                            # the rows are drawn a moment after the frame
+                self.closed = False
+                return self
+            self._still()
+            if attempt == 0:
+                # a list that closed the wrong way (a tooltip) can leave its box ignoring clicks until
+                # something else takes focus: a click on empty 3D view, top right, away from the plate
+                click(self.win, self.win["size"][0] - 70, 150)
+            time.sleep(0.5)
+        raise Stop("Orca's %s list did not open; click once in Orca's 3D view and try again" % self.kind)
+
+    def __exit__(self, *_exc):
+        if not self.closed and self._differs():
+            if self.column and getattr(self, "plain_y", None):
+                self.rest_at(self.plain_y)                  # an ordinary row first: Orca drops any submenu
+                time.sleep(0.15)
+            self._still()
+            self._click(self.quiet_x, TAB_ROW_Y)
+            wait_for(lambda: not self._differs(), 1.0)
+        self._still()
+        self.closed = True
+
+    # ---- reading
+    def read(self):
+        """The open list's rows, or [] when what is under the box is no list."""
+        top = self.box[1] + 14
+        if self.column:
+            shot = Shot(self.win, self.column - 12, top, 340, self.win["size"][1] - top - 4)
+        else:
+            shot = Shot(self.win, self.box_left - 8, top, 560, self.win["size"][1] - top - 4)
+        found = lines(shot.words())
+        column = list_column(found, self.box_left)
+        if column is None:
+            return []
+        entries = fill_missing(shot, list_entries(found, column), column)
+        headers = sum(1 for e in entries if e[0] == "header")
+        plain = [e for e in entries if e[0] == "item" and self.known.match(e[1])]
+        if not headers and len(plain) < 2:
+            return []
+        self.column = column
+        if plain:
+            self.plain_y = plain[len(plain) // 2][2]
+        return entries
+
+    # ---- scrolling
+    def wheel(self, y, notches):
+        # the pointer only holds still for the move: during the notches the wiggle has to go on, or the
+        # half second without motion brings up a tooltip and that closes the list. Few notches at a time:
+        # every row passing under the pointer swaps the list's tooltip, and a long burst can pop one up
+        with self._hold:
+            move_cursor(self.win["at"][0] + self.column + 60, self.win["at"][1] + int(y))
+        time.sleep(0.08)
+        proc = subprocess.run([tool("wlrctl"), "pointer", "wheel", str(notches)], capture_output=True, env=ENV, timeout=30)
+        if proc.returncode != 0:
+            raise Stop("this wlrctl can't turn the mouse wheel; run maker doctor")
+        time.sleep(0.25)
+
+    def presets_in(self, entries):
+        return {self.known.match(text): y for kind, text, y in entries if kind == "item" and self.known.match(text)}
+
+    def step(self, entries, notches):
+        """Scroll a little and read again; [] when nothing moved (an end of the list)."""
+        self.wheel(self.plain_y, notches)
+        new = self.read()
+        if not new:
+            raise Stop("Orca's %s list closed while scrolling" % self.kind)
+        return [] if [e[:2] for e in new] == [e[:2] for e in entries] else new
+
+    @staticmethod
+    def at_top(entries):
+        return bool(entries) and entries[0][0] == "header"
+
+    @staticmethod
+    def at_end(entries):
+        return bool(entries) and entries[-1][0] == "action"
+
+    def reopen(self):
+        self.__exit__()
+        self.__enter__()
+
+    def first_read(self):
+        """The list as it opened; reopened once when no list shows (a tooltip can still close it at once)."""
+        entries = self.read()
+        if not entries:
+            self.reopen()
+            entries = self.read()
+        if not entries:
+            raise Stop("couldn't read Orca's %s list" % self.kind)
+        return entries
+
+    def collect(self):
+        """{"column": x, "rows": [[name, y], ...]} for every preset, y being where the row sits when the list is
+        scrolled to its top. Pages are lined up through the presets two neighbouring pages share."""
+        entries = self.first_read()
+        for _ in range(12):                                     # up to the top in small steps
+            if self.at_top(entries):
+                break
+            new = self.step(entries, -2)
+            if not new:
+                break
+            entries = new
+        rows, order = {}, []
+        shift = 0
+        for _ in range(25):
+            seen = self.presets_in(entries)
+            shared = [name for name in seen if name in rows]
+            if shared:
+                shift = rows[shared[0]] - seen[shared[0]]
+            for name, y in seen.items():
+                if name not in rows:
+                    rows[name] = round(y + shift)
+                    order.append(name)
+            if self.at_end(entries):
+                break
+            new = self.step(entries, 2)
+            if not new:
+                break
+            entries = new
+        return {"column": self.column, "rows": [[name, rows[name]] for name in order]}
+
+    # ---- choosing
+    def choose(self, target, top_y=None):
+        """Read the list as it opened; click `target` when it shows, else scroll toward it (its remembered
+        position says which way) and look again."""
+        entries = self.first_read()
+        for _ in range(12):
+            if not entries:
+                return False
+            seen = self.presets_in(entries)
+            if target in seen:
+                return self._pick(seen[target])
+            direction = 2
+            if top_y is not None and seen:
+                name, y = next(iter(seen.items()))
+                remembered = getattr(self, "remembered", {}).get(name)
+                if remembered is not None:
+                    shift = remembered - y                     # how far down the list is scrolled
+                    direction = 2 if top_y - shift > y else -2
+            new = self.step(entries, direction)
+            if not new:
+                new = self.step(entries, -direction)
+            entries = new
+        return False
+
+    def _pick(self, y):
+        self._still()
+        self._click(self.column + 30, y)
+        self.closed = True
+        return True
+
+
+CHECK, PRINTER_ICON, PAGE_ICON, ACTION_ICON, LIST_ICON = "\U000f012c", "\U000f042b", "\U000f0219", "\U000f040a", "\U000f0279"
+MODEL_ICON, MESHY_ICON, WORDS_ICON, PICTURE_ICON, VIEWS_ICON, CREDITS_ICON, SIZE_ICON = (
+    "\U000f01a8", "\U000f0674", "\U000f03eb", "\U000f02e9", "\U000f02f9", "\U000f0584", "\U000f046d")
+PREP_ICON = "\U000f1194"                                  # md-tools
+KIT_ICON = "\U000f0c31"                                   # md-content-cut   # Nerd Font md- glyphs
+
+
+def by_name(names):
+    """Alphabetical, so a name always comes before longer names that start with it: Omarchy's menu picks the
+    first row matching what was typed ("0.20mm Standard @BBL X1C" before "0.20mm Standard @BBL X1C - abs")."""
+    return sorted(names, key=lambda n: (n.lower(), n))
+
+
+def menu(prompt, options):
+    """Omarchy's picker. options: labels, or (label, subtext, icon) tuples. The chosen label, or None."""
+    if not shutil.which("omarchy-menu-select", path=ENV.get("PATH")):
+        raise Stop("the Omarchy menu is missing (omarchy-menu-select)")
+    rows = []
+    for option in options:
+        label, subtext, icon = option if isinstance(option, tuple) else (option, None, None)
+        if subtext:
+            rows.append("%s\t%s\t%s" % (icon or " ", label, subtext))
+        elif icon:
+            rows.append("%s\t%s" % (icon, label))
+        else:
+            rows.append(label)
+    proc = subprocess.run(["omarchy-menu-select", prompt] + rows, capture_output=True, env=ENV, timeout=600)
+    choice = proc.stdout.decode().strip()
+    return choice.split("\t")[0] if proc.returncode == 0 and choice else None
+
+
+# ------------------------------------------------------------------------------------------------ setups
+SETUPS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "omarchy-maker", "orca-setups.json")
+SETUPS_EXAMPLE = """{
+  "setups": [
+    {"name": "A1", "printer": "A1", "filaments": ["Bambu PLA Basic @BBL A1"], "process": "0.20mm Standard @BBL A1", "plate": "Textured PEI Plate"}
+  ]
+}"""
+
+
+def load_setups():
+    """[{name, printer, filaments, process, plate}] from orca-setups.json ([] when there is none)."""
+    try:
+        data = json.load(open(SETUPS))
+    except FileNotFoundError:
+        return []
+    except ValueError as err:
+        raise Stop("%s is not valid JSON (%s)" % (SETUPS, err))
+    setups = []
+    for entry in data.get("setups", []) if isinstance(data, dict) else []:
+        if not isinstance(entry, dict) or not entry.get("name") or not entry.get("printer"):
+            raise Stop("every setup in %s needs a name and a printer" % SETUPS)
+        filaments = entry.get("filaments") or ([entry["filament"]] if entry.get("filament") else [])
+        setups.append({"name": entry["name"], "printer": entry["printer"], "filaments": list(filaments),
+                       "process": entry.get("process"), "plate": entry.get("plate")})
+    return setups
+
+
+def describe(setup):
+    return " · ".join(part for part in (", ".join(setup["filaments"]), setup["process"], setup["plate"]) if part)
+
+
+def apply_setup(win, setup, quiet_x):
+    """Printer first (it brings its own filament rows), then filaments, process and plate type. Returns what changed."""
+    headings = sidebar(win)
+    folded = headings["filament"] - headings["printer"] < PRINTER_SECTION_OPEN
+    if folded:
+        click(win, 55, headings["printer"])
+        time.sleep(0.8)
+        headings = sidebar(win)
+    changed = []
+    try:
+        if set_preset(win, "printer", None, setup["printer"], headings, quiet_x):
+            changed.append(setup["printer"])
+            time.sleep(0.8)
+            headings = sidebar(win)
+        slots = filament_slots(win, headings)
+        for slot, name in enumerate(setup["filaments"], 1):
+            if slot in slots and set_preset(win, "filament", slot, name, headings, quiet_x):
+                changed.append(name)
+        for kind in ("process", "plate"):
+            if setup[kind] and set_preset(win, kind, None, setup[kind], headings, quiet_x):
+                changed.append(setup[kind])
+    finally:
+        if folded:
+            click(win, 55, sidebar(win)["printer"])
+    return changed
+
+
+def cmd_setup(name):
+    setups = load_setups()
+    setup = next((s for s in setups if s["name"].lower() == name.lower()), None)
+    if not setup:
+        raise Stop("no setup called %s in %s" % (name, SETUPS))
+    win = orca_window()
+    focus(win)
+    tabs = tabs_for(win)
+    changed = apply_setup(win, setup, tabs["quiet_x"])
+    notify("Orca", "%s ready%s" % (setup["name"], (": " + ", ".join(changed)) if changed else ", nothing to change"))
+    return 0
+
+
+def cmd_setups():
+    setups = load_setups()
+    if not setups:
+        print("No setups yet. Put them in %s, for example:\n%s" % (SETUPS, SETUPS_EXAMPLE))
+        return 0
+    for setup in setups:
+        print("%-12s %s: %s" % (setup["name"], setup["printer"], describe(setup)))
+    return 0
+
+
+def list_key(win, kind, printer, slot=None):
+    """A list only changes with the printer, the user presets on disk, or the window's height."""
+    folder = {"printer": "machine", "filament": "filament", "process": "process", "plate": "machine"}[kind]
+    stamp = max([os.path.getmtime(f) for f in glob.glob(os.path.join(ORCA_CONFIG, "user", "*", folder))] or [0])
+    return "%s|%s|%s|%d|%d" % (kind, printer if kind in ("filament", "process") else "", slot or "", win["size"][1], stamp)
+
+
+def cmd_pick(kind, slot=None, choose=None):
+    win = orca_window()
+    focus(win)
+    tabs = tabs_for(win)
+    if tabs.get("quiet_x") is None:
+        raise Stop("Orca's window is too narrow to work its lists; make it wider")
+    headings = sidebar(win)
+    folded = kind in ("printer", "plate") and headings["filament"] - headings["printer"] < PRINTER_SECTION_OPEN
+    if folded:
+        click(win, 55, headings["printer"])            # open the Printer section; folded again at the end
+        time.sleep(0.8)
+        headings = sidebar(win)
+    try:
+        return pick(win, kind, slot, choose, headings, tabs["quiet_x"])
+    finally:
+        if folded:
+            click(win, 55, headings["printer"])
+
+
+def locate(win, kind, slot, headings):
+    """(box centre, box left edge, slot) for a kind of preset."""
+    if kind == "filament":
+        slots = filament_slots(win, headings)
+        if not slots:
+            raise Stop("can't see the filament boxes")
+        if slot not in slots:
+            raise Stop("Orca shows filament slots %s, not %d" % (", ".join(map(str, slots)), slot))
+        box = slots[slot]
+        return box, FILAMENT_COLUMNS[0 if box[0] == FILAMENT_COLUMNS[0]["click"] else 1]["left"]
+    if kind not in BOX_X:
+        raise Stop("pick what? printer, filament, process or plate")
+    y = headings["process" if kind == "process" else "printer"] + BOX_BELOW_HEADING[kind]
+    return (BOX_X[kind], y), BOX_LEFT[kind]
+
+
+def selected_now(kind, slot, log=None):
+    """The preset Orca has selected; for the process, with a log, only what was logged since that log was opened."""
+    if kind == "process":
+        return log.latest_process(since_start=True) if log else current_process()
+    return current_selection(kind, slot or 1)
+
+
+def remembered_list(win, kind, slot, box, box_left, quiet_x, known):
+    """The list's names with their page and row, read once and kept until presets or the window change."""
+    key = "%s|%d|v2" % (list_key(win, kind, current_selection("printer"), slot), round(box[1]))
+    data = load_layout()
+    if key not in data["lists"]:
+        with OrcaList(win, kind, box, box_left, quiet_x, known) as orca_list:
+            found = orca_list.collect()
+        if not found["rows"]:
+            raise Stop("couldn't read Orca's %s list" % kind)
+        data = load_layout()
+        data["lists"][key] = found
+        save_layout(data)
+    return key, data["lists"][key]
+
+
+def set_preset(win, kind, slot, target, headings, quiet_x, known=None, listed=None):
+    """Switch one preset to `target` and wait until Orca's settings say so. True when it changed."""
+    if selected_now(kind, slot) == target:
+        return False
+    box, box_left = locate(win, kind, slot, headings)
+    known = known or Names(PLATE_TYPES if kind == "plate" else preset_names(kind))
+    if listed is None:
+        _key, listed = remembered_list(win, kind, slot, box, box_left, quiet_x, known)
+    rows = {name: y for name, y in listed["rows"]}
+    if target not in rows:
+        raise Stop("%s is not in Orca's %s list" % (target, kind))
+    log = OrcaLog()
+    with OrcaList(win, kind, box, box_left, quiet_x, known, column=listed["column"]) as orca_list:
+        orca_list.remembered = rows
+        found = orca_list.choose(target, rows[target])
+    if not found:
+        forget_lists()
+        raise Stop("couldn't find %s in Orca's %s list; it changed, try again" % (target, kind))
+    last_dialog_check = 0
+    deadline = time.time() + 8
+    now = None
+    while time.time() < deadline:
+        now = selected_now(kind, slot, log)
+        if now == target:
+            return True
+        if time.time() - last_dialog_check > 0.6:
+            last_dialog_check = time.time()
+            dialogs = [c.get("title") for c in hyprctl_json("clients") if c.get("class") == ORCA_CLASS and c.get("floating")]
+            if dialogs:
+                raise Stop("Orca is asking: %s (answer it in Orca)" % ", ".join(dialogs))
+        time.sleep(0.12)
+    raise Stop("clicked %s but Orca still shows %s" % (target, now))
+
+
+def pick(win, kind, slot, choose, headings, quiet_x):
+    if kind == "filament" and slot is None:
+        slots = filament_slots(win, headings)
+        if len(slots) <= 1 or choose is not None:
+            slot = 1
+        else:
+            labels = [("Filament %d" % n, current_selection("filament", n) or "", LIST_ICON) for n in slots]
+            picked = menu("Filament slot", labels)
+            if not picked:
+                return 0
+            slot = int(re.match(r"Filament (\d+)", picked).group(1))
+    box, box_left = locate(win, kind, slot, headings)
+    known = Names(PLATE_TYPES if kind == "plate" else preset_names(kind))
+    _key, listed = remembered_list(win, kind, slot, box, box_left, quiet_x, known)
+    names = [name for name, _y in listed["rows"]]
+    current = selected_now(kind, slot)
+    title = {"printer": "Printer", "filament": "Filament %d" % (slot or 1), "process": "Process", "plate": "Plate type"}[kind]
+    setups = load_setups() if kind == "printer" and choose is None else []
+    if choose is None:
+        options = [(s["name"], describe(s), CHECK if s["printer"] == current else PRINTER_ICON) for s in setups]
+        options += [(n, None, CHECK) if n == current else n for n in by_name(names) if n not in {s["name"] for s in setups}]
+        target = menu(title, options)
+    else:
+        target = choose
+    if not target:
+        return 0
+    setup = next((s for s in setups if s["name"] == target), None)
+    if setup:
+        changed = apply_setup(win, setup, quiet_x)
+        notify("Orca", "%s ready%s" % (setup["name"], (": " + ", ".join(changed)) if changed else ", nothing to change"))
+        return 0
+    if target == current:
+        notify("Orca", "%s is already %s" % (title, current))
+        return 0
+    set_preset(win, kind, slot, target, headings, quiet_x, known, listed)
+    notify("Orca", "%s: %s" % (title, target))
+    return 0
+
+
+ACTIONS = (("Slice plate", "CTRL", "R"), ("Print plate", "CTRL SHIFT", "G"), ("Export sliced file", "CTRL", "G"),
+           ("Next plate", None, None), ("Previous plate", None, None),
+           ("Search settings", "CTRL", "F"), ("Preferences", "CTRL", "P"))
+KIND_LABELS = {"printer": "Printer", "filament": "Filament", "process": "Process", "plate": "Plate type"}
+
+
+def orca_shortcut(win, mods, key):
+    """One of Orca's own shortcuts, only ever into Orca."""
+    focus(win)
+    time.sleep(0.15)
+    lua('local w = hl.get_active_window() if w and w.class == "%s" then hl.dispatch(hl.dsp.send_shortcut({ mods = "%s", key = "%s" })) end'
+        % (ORCA_CLASS, mods, key))
+
+
+def remembered_presets(win):
+    """(kind, slot, name) for every preset list read before that still fits the current printer and window."""
+    printer = current_selection("printer")
+    found, seen = [], set()
+    for key, listed in load_layout()["lists"].items():
+        kind, key_printer, slot = key.split("|")[:3]
+        slot = int(slot) if slot else None
+        if kind not in KIND_LABELS or not key.startswith(list_key(win, kind, printer, slot) + "|"):
+            continue
+        for name, _y in listed.get("rows", []):
+            if (kind, slot, name) not in seen:
+                seen.add((kind, slot, name))
+                found.append((kind, slot, name))
+    return found
+
+
+def cmd_menu():
+    win = orca_window()
+    focus(win)
+    options = [("Setup: %s" % s["name"], describe(s), PRINTER_ICON) for s in load_setups()]
+    options += [("Go to %s" % page.capitalize(), None, PAGE_ICON) for page in PAGES]
+    options += [(label, None, ACTION_ICON) for label, _mods, _key in ACTIONS]
+    options += [("%s..." % label, "pick from Orca's list", LIST_ICON) for label in KIND_LABELS.values()]
+    options += [("Put a model on the plate...", "your Meshy models, Downloads, 3D_Exports, Orca's recent projects", MODEL_ICON),
+                ("Show the keys", "Ctrl+Alt with Orca; this menu lists everything", CHECK)]
+    options += [(label, "open it, or bring it forward (its own workspace, never tiled with Orca)", ACTION_ICON) for label, _cmd in other_apps()]
+    options += [
+                ("Make a model with Meshy...", "describe it, or give it pictures", MESHY_ICON),
+                ("Prepare for a test print", "lay it down, 10% infill, no brim, supports only if Orca asks", PREP_ICON),
+                ("Slow the speeds a touch", "bridges slower still, overhangs a touch quicker", PREP_ICON),
+                ("Cut a model into parts...", "parts that slot together and each print flat (Blender)", KIT_ICON),
+                ("Clear the plate", "take everything off it (Ctrl+Z in Orca puts it back)", KIT_ICON),
+                ("Check the Orca keys", "a live check on an empty plate: pages, a model, slicing, the print window", CHECK)]
+    presets = []
+    for kind, slot, name in remembered_presets(win):
+        label = "Filament %d" % slot if kind == "filament" and slot else KIND_LABELS[kind]
+        presets.append("%s: %s" % (label, name))
+    options += by_name(presets)
+    choice = menu("Orca", options)
+    if not choice:
+        return 0
+    if choice.startswith("Setup: "):
+        return cmd_setup(choice[len("Setup: "):])
+    if choice.startswith("Go to "):
+        return cmd_page(choice[len("Go to "):].lower())
+    if choice == "Print plate":
+        return cmd_print()
+    if choice in ("Next plate", "Previous plate"):
+        return cmd_plate("next" if choice == "Next plate" else "prev")
+    for label, mods, key in ACTIONS:
+        if choice == label:
+            orca_shortcut(win, mods, key)
+            return 0
+    for kind, label in KIND_LABELS.items():
+        if choice == label + "...":
+            return cmd_pick(kind)
+    if choice == "Put a model on the plate...":
+        return cmd_open()
+    if choice == "Make a model with Meshy...":
+        return cmd_meshy()
+    if choice == "Prepare for a test print":
+        return cmd_prep()
+    if choice == "Slow the speeds a touch":
+        return cmd_speeds()
+    if choice == "Cut a model into parts...":
+        return cmd_kit()
+    if choice == "Clear the plate":
+        return cmd_clear()
+    if choice == "Check the Orca keys":
+        return cmd_selfcheck()
+    if choice == "Show the keys":
+        return cmd_hint()
+    for label, cmd in other_apps():
+        if choice == label:
+            return open_app(label, cmd)
+    match = re.match(r"^(Printer|Filament|Process|Plate type)(?: (\d+))?: (.+)$", choice)
+    if match:
+        kind = {v: k for k, v in KIND_LABELS.items()}[match.group(1)]
+        return cmd_pick(kind, int(match.group(2)) if match.group(2) else (1 if kind == "filament" else None), match.group(3))
+    return 0
+
+
+# The other maker apps, each on a workspace of its own (hypr/maker.lua), reached from this menu so that no workspace
+# number and no key has to be remembered. Bringing one forward is a focus on its window; opening one is its launcher.
+OTHER_APPS = (("Blender", "blender", "blender", ["blender"]),
+              ("OpenSCAD", "OpenSCAD", "openscad", [os.path.expanduser("~/.local/bin/maker-run"), "openscad"]),
+              ("Bambu Studio", "bambu-studio", "bambu", [os.path.expanduser("~/.local/bin/maker-run"), "bambu"]))
+
+
+def other_apps():
+    """(menu label, command) for each other maker app that is installed."""
+    found = []
+    for label, _cls, app, cmd in OTHER_APPS:
+        if app == "blender":
+            if shutil.which("blender", path=ENV.get("PATH")):
+                found.append((label, cmd))
+        elif subprocess.run([os.path.expanduser("~/.local/bin/maker"), "has", app], capture_output=True, env=ENV).returncode == 0:
+            found.append((label, cmd))
+    return found
+
+
+def open_app(label, cmd):
+    cls = next(c for l, c, _a, _cmd in OTHER_APPS if l == label)
+    for win in hyprctl_json("clients"):
+        if win.get("class") == cls and not win.get("title", "").startswith("Blender "):     # a main window, not a dialog
+            lua('for _, w in ipairs(hl.get_windows()) do if w.address == "%s" then hl.dispatch(hl.dsp.focus({ window = w })) end end' % win["address"])
+            return 0
+    launcher = ["uwsm-app", "--"] if shutil.which("uwsm-app", path=ENV.get("PATH")) else []
+    subprocess.Popen(launcher + cmd, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    notify("Orca", "opening %s on its own workspace" % label)
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ print
+# Orca's "Send print job" dialog for Bambu printers: 700 x 660, printer box near the top, its list opening below
+# with the selected printer first; Orca logs every choice ("for send task, current printer id = SERIAL") and the
+# dialog's verdict ("show_status: update_status: 58(PrintStatusReadyToGo)"). Nothing here ever presses Send.
+SEND_TITLE = "Send print job"
+# The layout moves with the printer (an A1 adds a Flow Dynamics row and everything sits higher), so positions are
+# measured from the "Printer" heading: the box below it, the selected name in the box, the list rows under the box.
+SEND_BOX_BELOW, SEND_NAME_BELOW, SEND_ROW0_BELOW = 52, 22, 108
+SEND_ROWS_X, SEND_ROW_STEP = 287, 42           # names start right of each printer's picture
+SEND_EMPTY = (40, 40)                          # blank corner: a click there closes the open list
+STATUS_WORDS = {"PrintStatusReadyToGo": "ready to go", "PrintStatusAmsMappingSuccess": "ready to go",
+                "PrintStatusInPrinting": "busy printing", "PrintStatusInSystemPrinting": "busy with a printer job",
+                "PrintStatusNoUserLogin": "Orca is not signed in", "PrintStatusReadingTimeout": "the printer did not answer",
+                "PrintStatusNotOnTheSameLAN": "not on this network", "PrintStatusNoSdcard": "no SD card in the printer",
+                "PrintStatusLanModeNoSdcard": "no SD card in the printer", "PrintStatusInUpgrading": "updating its firmware",
+                "PrintStatusNeedForceUpgrading": "needs a firmware update", "PrintStatusNeedConsistencyUpgrading": "needs a firmware update",
+                "PrintStatusAmsMappingInvalid": "the filament slots need a choice", "PrintStatusBlankPlate": "the plate is empty in Orca"}
+# Orca passes through these while it talks to a printer; any other status is its verdict (SelectMachine / PrePrintChecker)
+PASSING_STATUSES = {"PrintStatusInit", "PrintStatusInvalidPrinter", "PrintStatusConnectingServer", "PrintStatusReading",
+                    "PrintStatusConnecting", "PrintStatusReconnecting", "PrintStatusRefreshingMachineList",
+                    "PrintStatusAmsOnSettingup", "PrintStatusReadingFinished"}
+MAKER_PRINTERS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "omarchy-maker", "printers.json")
+
+
+def send_dialog():
+    return next((c for c in orca_dialogs() if c.get("title") == SEND_TITLE), None)
+
+
+def plate_buttons(win):
+    """{"slice": (x, enabled), "print": (x, enabled)} for Orca's Slice plate and Print plate buttons (right of the tabs).
+    A button Orca would act on is Orca teal; a disabled one is grey."""
+    shot = Shot(win, win["size"][0] - 420, TAB_ROW_Y - 20, 420, 40)
+    words = sorted(shot.words(), key=lambda w: w["x"])
+    found = {}
+    for first, second in zip(words, words[1:]):
+        verb = best_match(first["text"], ["Slice", "Print"], 0.75)
+        if verb and best_match(second["text"], ["plate"], 0.75) and 0 < second["x"] - first["x"] < 80:
+            end = second["x"] + second["w"]
+            r, g, b = shot.pixel(end + 6, TAB_ROW_Y)
+            found[verb.lower()] = ((first["x"] + end) / 2, g > r + 40 and g > 70)
+    if "print" not in found:
+        raise Stop("can't find Orca's Print plate button (is the window wide enough?)")
+    found.setdefault("slice", (None, False))
+    return found
+
+
+def status_words(name):
+    return STATUS_WORDS.get(name) or re.sub(r"(?<!^)([A-Z])", r" \1", re.sub(r"^PrintStatus", "", name)).lower()
+
+
+def printer_heading(dialog):
+    """y of the "Printer" heading in the print window (the print window's other positions hang off it)."""
+    shot = Shot(dialog, 200, 60, 260, 320)
+    for word in shot.words(psm=11):
+        if best_match(word["text"], ["Printer"], 0.8):
+            return word["y"] + word["h"] / 2
+    raise Stop("can't find the printer box in Orca's print window")
+
+
+def row_texts(dialog, heading):
+    """{row: text} for the lines that sit where the printer list's rows open."""
+    row0 = heading + SEND_ROW0_BELOW
+    shot = Shot(dialog, SEND_ROWS_X, row0 - SEND_ROW_STEP // 2, 240, SEND_ROW_STEP * 8)
+    found = {}
+    for line in lines(shot.words(psm=11, min_conf=10)):
+        row = round((line["y"] - row0) / SEND_ROW_STEP)
+        if row >= 0 and abs(line["y"] - (row0 + row * SEND_ROW_STEP)) <= 10 and re.search(r"\w", line["text"]):
+            found.setdefault(row, line["text"])
+    return found
+
+
+def printer_rows(dialog, heading, closed=None):
+    """Names in the open printer list, top to bottom. Text that was there with the list closed (Orca's red warning
+    under the printer box) is not a printer."""
+    found = row_texts(dialog, heading)
+    names = []
+    while len(names) in found and found[len(names)] != (closed or {}).get(len(names)):
+        names.append(known_printer(found[len(names)]))
+    return names
+
+
+def maker_printers():
+    try:
+        with open(MAKER_PRINTERS) as handle:
+            return [p for p in json.load(handle).get("printers", []) if isinstance(p, dict) and p.get("name")]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def known_printer(text):
+    """A printer name as you wrote it in maker's printer list, when Tesseract's reading is close (A1, not Al)."""
+    return best_match(text, [p["name"] for p in maker_printers()], 0.6) or text
+
+
+def plate_photo(name, found):
+    """A fresh chamber camera frame from a Bambu printer added with maker printer add-bambu (P1 and A1, LAN Mode
+    Liveview on), into found["photo"]. The access code goes to maker-bambu in its environment, never in argv."""
+    entry = next((p for p in maker_printers() if p["name"] == name and p.get("type") == "bambu" and p.get("accessCode")), None)
+    if not entry:
+        return
+    path = os.path.join(ENV["XDG_RUNTIME_DIR"], "maker-plate-%s.jpg" % re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-"))
+    env = dict(ENV, BAMBU_HOST=entry.get("host", ""), BAMBU_SERIAL=entry.get("serial", ""),
+               BAMBU_ACCESS_CODE=entry["accessCode"], BAMBU_FINGERPRINT=entry.get("fingerprint", ""))
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        proc = subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-bambu"), "snapshot", path],
+                              env=env, capture_output=True, timeout=40)
+        if proc.returncode == 0 and os.path.getsize(path) > 0:
+            found["photo"] = path
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def settled_status(log, timeout):
+    """(Orca's latest print status name, settled?) once it stops passing through reading/connecting states."""
+    last, deadline = None, time.time() + timeout
+    while True:
+        found = log.last(r"show_status: update_status: \d+\((\w+)\)")
+        last = found.group(1) if found else last
+        if last and last not in PASSING_STATUSES:
+            return last, True
+        if time.time() >= deadline:
+            return last, False
+        time.sleep(0.4)
+
+
+def selected_printer(dialog, heading):
+    shot = Shot(dialog, SEND_ROWS_X, heading + SEND_NAME_BELOW, 235, 34)
+    return " ".join(w["text"] for w in sorted(shot.words(psm=7, min_conf=0), key=lambda w: w["x"])).strip()
+
+
+def toasts_up():
+    layers = hyprctl_json("layers")
+    return any(l.get("namespace") == "omarchy-notifications" for m in layers.values() for lv in m.get("levels", {}).values() for l in lv)
+
+
+def clear_toasts():
+    """Omarchy's notifications show over Orca's top-right buttons: dismiss maker's own, give the rest a moment."""
+    if shutil.which("omarchy-notification-dismiss", path=ENV.get("PATH")):
+        for summary in ("Orca", "Print on"):
+            run(["omarchy-notification-dismiss", summary], check=False)
+    return wait_for(lambda: not toasts_up(), 4, step=0.15)
+
+
+PLATE_STATE = re.compile(rb"update_slice_print_status .*?enable_slice (\d), enable_print (\d)")
+
+
+def plate_state(since=None):
+    """(Slice plate enabled?, Print plate enabled?) as Orca last logged them; only lines after `since` (an OrcaLog) when given."""
+    log = since or OrcaLog()
+    if not log.path:
+        return None
+    with open(log.path, "rb") as handle:
+        handle.seek(log.offset if since else max(0, os.path.getsize(log.path) - 4_000_000))
+        found = PLATE_STATE.findall(handle.read())
+    return (found[-1][0] == b"1", found[-1][1] == b"1") if found else None
+
+
+def print_button_x(win):
+    """Where Orca's Print plate button is, read once per window size (a notification over it gets dismissed first)."""
+    tabs_for(win)
+    data, key = load_layout(), size_key(win)
+    if not data["tabs"][key].get("print_x"):
+        clear_toasts()
+        data["tabs"][key]["print_x"] = plate_buttons(win)["print"][0]
+        save_layout(data)
+    return data["tabs"][key]["print_x"]
+
+
+PLATE_EVENTS = re.compile(rb"after add_objects_to_list|Undo / Redo snapshot reloaded|got (\d+) printable istances")
+
+
+def printable_on_plate():
+    """How many printable objects Orca counts on the current plate. Orca logs the count about a second after every
+    import, undo, plate switch and slice, so the count only counts when nothing changed the plate after it:
+    None while an import or undo has not been counted yet, or before Orca has logged any."""
+    found = OrcaLog.recent(PLATE_EVENTS)
+    return int(found[-1]) if found and found[-1] else None
+
+
+def plate_buttons_now(win):
+    """(Print plate enabled?, Slice plate enabled?) as Orca shows them, or None while a notification covers them.
+    The screen, not the log: Orca does not log again after an undo empties the plate."""
+    if toasts_up():
+        return None
+    try:
+        buttons = plate_buttons(win)
+    except Stop:
+        return None
+    return buttons["print"][1], buttons["slice"][1]
+
+
+def slice_first(win):
+    """Slice the plate and wait until Orca can print it: Print plate lights up (or Orca logs it while a notification
+    covers the button). Slice plate lit again without Print plate means the slicing stopped."""
+    watch = OrcaLog()
+    orca_shortcut(win, "CTRL", "R")
+    notify("Orca", "slicing the plate first")
+    started, stopped = time.time(), 0
+    while time.time() - started < 600:
+        time.sleep(1.0)
+        logged = plate_state(watch)
+        if logged and logged[1]:
+            return
+        shown = plate_buttons_now(win)
+        if shown is None:
+            continue
+        if shown[0]:
+            return
+        stopped = stopped + 1 if shown[1] and time.time() - started > 5 else 0
+        if stopped >= 3:
+            raise Stop("the slicing did not finish; Orca shows why")
+    raise Stop("the slicing is taking more than 10 minutes; press g again when it is done")
+
+
+def open_send_dialog(win):
+    """Click Print plate (slicing first when Orca can't print yet) and wait for the send dialog."""
+    if printable_on_plate() == 0:
+        raise Stop("nothing to print on this plate yet: put a model on it (o)")
+    x = print_button_x(win)
+    clear_toasts()
+    shown = plate_buttons_now(win)
+    if shown is None:                                  # something else covers the buttons: the log's word for it
+        logged = plate_state()
+        shown = (logged[1], logged[0]) if logged else (True, False)
+    can_print, can_slice = shown
+    if not can_print:
+        if not can_slice:
+            raise Stop("nothing to print yet: put a model on the plate (o), or let the slicing finish")
+        slice_first(win)
+    if not clear_toasts():
+        raise Stop("a notification is over Orca's Print plate button; press g again when it is gone")
+    before = {c["address"] for c in orca_dialogs()}
+    log = OrcaLog()
+    click(win, x, TAB_ROW_Y, settle=0.06)
+    dialog = wait_for(lambda: next((c for c in orca_dialogs() if c["address"] not in before), None), 10, step=0.2)
+    if not dialog:
+        raise Stop("Orca's print window did not open")
+    if dialog.get("title") != SEND_TITLE:
+        notify("Orca", "Orca opened %s" % dialog.get("title"))
+        return None, log
+    wait_for(lambda: log.last(r"show_status: update_status: \d+"), 30, step=0.3)
+    return dialog, log
+
+
+def list_state(dialog, heading):
+    """(printer list open?, selected row) from pixels: the selected printer's row is tinted teal while the list is open."""
+    row0 = heading + SEND_ROW0_BELOW
+    shot = Shot(dialog, 490, row0 - 10, 20, SEND_ROW_STEP * 8)
+    for row in range(8):
+        r, g, b = shot.pixel(500, row0 + row * SEND_ROW_STEP)
+        if g - r > 12 and b - r > 12:
+            return True, row
+    return False, None
+
+
+def close_list(dialog, heading):
+    """Close the printer list (a click on the window's blank corner) and wait until it really is closed."""
+    click(dialog, *SEND_EMPTY)
+    wait_for(lambda: not list_state(dialog, heading)[0], 1.5, step=0.1)
+
+
+def warning_under_box(dialog, heading):
+    """Orca's red warning under the printer box (an incompatible printer) sits where the list's rows open."""
+    row0 = heading + SEND_ROW0_BELOW
+    shot = Shot(dialog, SEND_ROWS_X, row0 - SEND_ROW_STEP // 2, 270, SEND_ROW_STEP)
+    return any(c[0] > 150 and c[1] < 100 and c[2] < 100
+               for c in (shot.pixel(x, y) for x in range(SEND_ROWS_X, SEND_ROWS_X + 270, 3)
+                         for y in range(int(row0 - SEND_ROW_STEP // 2), int(row0 + SEND_ROW_STEP // 2), 3)))
+
+
+def read_printers(dialog):
+    """(printer names in the print window's list, the one selected, the heading y). The list opens, is read once, and
+    closes; whether it is open and which row is selected come from pixels, the names from one Tesseract read."""
+    names, heading, selected = [], None, None
+    deadline = time.time() + 8                   # a window that just opened is still drawing and filling its list
+    while time.time() < deadline and not names:
+        focus(dialog)
+        try:
+            heading = printer_heading(dialog)
+        except Stop:
+            time.sleep(0.25)
+            continue
+        closed = row_texts(dialog, heading) if warning_under_box(dialog, heading) else {}
+        click(dialog, 330, heading + SEND_BOX_BELOW)
+        state = wait_for(lambda: (lambda st: st if st[0] else None)(list_state(dialog, heading)), 2, step=0.1)
+        if state:
+            names = printer_rows(dialog, heading, closed)
+            selected = state[1]
+        close_list(dialog, heading)
+        if not names:
+            time.sleep(0.25)
+    if heading is None:
+        raise Stop("can't find the printer box in Orca's print window")
+    if not names:
+        raise Stop("can't read the printer list in Orca's print window")
+    if selected is not None and selected < len(names):
+        return names, names[selected], heading
+    current = selected_printer(dialog, heading)
+    return names, best_match(current, names, 0.6) or (names[0] if len(names) == 1 else current), heading
+
+
+def close_send_dialog(dialog):
+    """Close Orca's print window without sending: a click on its blank corner (closes an open list), then close it."""
+    click(dialog, *SEND_EMPTY)
+    time.sleep(0.4)
+    lua('for _, w in ipairs(hl.get_windows()) do if w.address == "%s" then hl.dispatch(hl.dsp.window.close({ window = w })) end end'
+        % dialog["address"])
+    if not wait_for(lambda: not send_dialog(), 6, step=0.2):
+        raise Stop("Orca's print window did not close")
+
+
+def setup_for(printer):
+    """The setup named after a printer (orca-setups.json), if there is one."""
+    return next((s for s in load_setups() if s["name"].lower() == printer.lower()), None)
+
+
+def cmd_print(printer=None):
+    """Open Orca's print window and pick the printer in it from an Omarchy menu. Printer first: when a setup carries
+    that printer's name and the plate was sliced with another printer preset, that setup is applied and the plate
+    sliced again before the printer is picked. You press Send."""
+    dialog = send_dialog()
+    log = OrcaLog()
+    if dialog:                                   # open already: its latest verdict is in the recent log
+        log.offset = max(0, log.offset - 2_000_000)
+    else:
+        win = orca_window()
+        focus(win)
+        dialog, log = open_send_dialog(win)
+        if not dialog:
+            return 0
+    names, current, heading = read_printers(dialog)
+    if printer is None:
+        last = load_layout().get("last_printer")
+        ordered = sorted(names, key=lambda n: n != last)          # Enter prints where you printed last
+        options = [(n, "last time" if n == last else ("selected now" if n == current else None), PRINTER_ICON) for n in ordered]
+        printer = menu("Print on", options)
+        if not printer:
+            return 0
+    target = best_match(printer, names, 0.8)
+    if not target:
+        raise Stop("no printer called %s in Orca's list (%s)" % (printer, ", ".join(names)))
+    setup = setup_for(target)
+    if setup and current_selection("printer") != setup["printer"]:
+        close_send_dialog(dialog)
+        win = orca_window()
+        focus(win)
+        notify("Orca", "%s: your %s setup first, then slicing again" % (target, setup["name"]))
+        apply_setup(win, setup, tabs_for(win)["quiet_x"])
+        if current_selection("printer") != setup["printer"]:
+            raise Stop("Orca did not switch to the %s setup" % setup["name"])
+        dialog, log = open_send_dialog(win)
+        if not dialog:
+            return 0
+        names, current, heading = read_printers(dialog)
+        target = best_match(printer, names, 0.8)
+        if not target:
+            raise Stop("no printer called %s in Orca's list (%s)" % (printer, ", ".join(names)))
+    if target != current:
+        log.mark()
+        rows = []
+        for attempt in range(3):                         # read again at the click: the list fills, re-sorts and moves
+            focus(dialog)
+            heading = printer_heading(dialog)
+            closed = row_texts(dialog, heading) if warning_under_box(dialog, heading) else {}
+            click(dialog, 330, heading + SEND_BOX_BELOW)
+            rows = printer_rows(dialog, heading, closed) if wait_for(lambda: list_state(dialog, heading)[0], 2, step=0.1) else []
+            if target in rows:
+                break
+            close_list(dialog, heading)
+            time.sleep(0.3)
+        if target not in rows:
+            raise Stop("%s is not in Orca's printer list right now; press g again" % target)
+        click(dialog, SEND_ROWS_X + 20, heading + SEND_ROW0_BELOW + SEND_ROW_STEP * rows.index(target))
+        picked = wait_for(lambda: log.last(r"on_selection_changedfor send task, current printer id"), 8, step=0.3)
+
+        def shows_target():                              # the layout keeps moving while Orca talks to the printer
+            try:
+                return best_match(selected_printer(dialog, printer_heading(dialog)), [target], 0.6) == target
+            except Stop:
+                return False
+        if not picked or not wait_for(shows_target, 5, step=0.4):
+            raise Stop("Orca did not switch to %s; pick it in the print window" % target)
+    found = {}
+    camera = threading.Thread(target=plate_photo, args=(target, found), daemon=True)
+    camera.start()
+    status, settled = settled_status(log, 25)
+    words = status_words(status) if status else "no word from Orca yet"
+    ready = status in ("PrintStatusReadyToGo", "PrintStatusAmsMappingSuccess") or (settled and "Warning" in status)
+    photo_coming = camera.is_alive() and any(p["name"] == target and p.get("accessCode") for p in maker_printers())
+
+    def text_for(photo):
+        if ready:
+            check = "check the plate in the photo" if photo else ("a photo of the plate is on its way" if photo_coming else "check the plate is empty")
+            return "%s · %s, then press Send" % (words, check)
+        if settled:
+            return "not ready: %s (Orca's print window says more)" % words
+        return "still %s · watch Orca's print window" % words
+
+    data = load_layout()
+    if data.get("last_printer") != target:
+        data["last_printer"] = target
+        save_layout(data)
+    toast = notify("Print on %s" % target, text_for(found.get("photo")), seconds=15, image=found.get("photo"))
+    if photo_coming:                                  # Orca's verdict first, the photo joins the same toast
+        camera.join(20)
+        if found.get("photo"):
+            notify("Print on %s" % target, text_for(found["photo"]), seconds=15, image=found["photo"], replace=toast)
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ plates
+# Orca has no key for plates. Preview draws them as a column of thumbnails at the left of the 3D view: "Slice all" on
+# top (never clicked here), then one dark square per plate, the current plate lighter with a teal border.
+def teal(c):
+    return c[1] > c[0] + 60 and c[1] > 90
+
+
+def plate_column(win):
+    """(the current plate's thumbnail box (x0, y0, x1, y1), [(y0, y1) of the other plate thumbnails in its column])."""
+    shot = Shot(win, 0, 60, min(win["size"][0], 1100), win["size"][1] - 100)
+    step, cells = 3, set()
+    for y in range(shot.dy, shot.dy + shot.h, step):
+        for x in range(shot.dx, shot.dx + shot.w, step):
+            if teal(shot.pixel(x, y)):
+                cells.add((x, y))
+    reach = [(dx, dy) for dx in range(-2 * step, 2 * step + 1, step) for dy in range(-2 * step, 2 * step + 1, step) if dx or dy]
+    boxes, seen = [], set()
+    for start in cells:                          # the 2 px teal outline with round corners: join cells up to 2 steps apart
+        if start in seen:
+            continue
+        stack, xs, ys = [start], [], []
+        seen.add(start)
+        while stack:
+            x, y = stack.pop()
+            xs.append(x)
+            ys.append(y)
+            for dx, dy in reach:
+                n = (x + dx, y + dy)
+                if n in cells and n not in seen:
+                    seen.add(n)
+                    stack.append(n)
+        w, h = max(xs) - min(xs), max(ys) - min(ys)
+        if 60 <= w <= 220 and 60 <= h <= 220 and 0.7 <= w / float(h) <= 1.4 and len(xs) < (w + h) * 2 / step:
+            boxes.append((min(xs), min(ys), max(xs), max(ys)))
+    if len(boxes) != 1:
+        raise Stop("can't see Orca's plate list (Preview shows it when the project has more than one plate)")
+    box = boxes[0]
+    # down the right edge of the column: every item (the stats item on top, then each plate) is a block that differs
+    # from the panel colour, separated from the next by a strip of panel
+    x = box[2] - 6
+    panel = shot.pixel(x, box[1] - 4)
+    height = box[3] - box[1]
+    blocks, run = [], None
+    for y in range(shot.dy, shot.dy + shot.h + 1):
+        inside = y < shot.dy + shot.h and sum(abs(a - b) for a, b in zip(shot.pixel(x, y), panel)) > 12
+        if inside and run is None:
+            run = y
+        elif not inside and run is not None:
+            if 0.6 * height <= y - run <= 1.4 * height:
+                blocks.append((run, y - 1))
+            run = None
+    return box, blocks
+
+
+def plate_count():
+    found = OrcaLog.recent(rb"update_plate_cols:m_plate_count (\d+)")
+    return int(found[-1]) if found else None
+
+
+def plate_target(box, blocks, count, where):
+    """(index, (top, bottom)) of the plate to click: blocks are the stats item and then every plate, top to bottom."""
+    if len(blocks) != count + 1:                     # everything in view, or nothing is clicked
+        raise Stop("Orca's plate list does not fit in the window; pick that plate with the mouse")
+    plates = blocks[1:]
+    centre = (box[1] + box[3]) / 2
+    current = next((i for i, (a, b) in enumerate(plates) if a - 6 <= centre <= b + 6), None)
+    if current is None:
+        raise Stop("can't tell which plate is selected")
+    target = (current + (1 if where == "next" else -1)) % count
+    return target, plates[target]
+
+
+def cmd_plate(where):
+    """Select the next or previous plate by clicking its thumbnail in Preview, then go back to the page you were on."""
+    win = orca_window()
+    focus(win)
+    tabs = tabs_for(win)
+    pages = {k: v for k, v in tabs.items() if k in PAGES}
+    back = selected_page(tab_strip(win), pages)
+    count = plate_count()
+    if not count or count < 2:
+        raise Stop("this project has one plate")
+    if back != "preview":
+        go_to_page(win, "preview")
+        time.sleep(0.4)
+    try:
+        box, blocks = plate_column(win)
+        target, (top, bottom) = plate_target(box, blocks, count, where)
+        middle = (top + bottom) // 2
+        click(win, (box[0] + box[2]) // 2, middle, settle=0.06)
+        if not wait_for(lambda: abs(sum(plate_column(win)[0][1::2]) / 2 - middle) < 0.3 * (bottom - top), 2, step=0.2):
+            raise Stop("Orca did not switch plates")
+        notify("Orca", "plate %d of %d" % (target + 1, count))
+    finally:
+        if back and back != "preview":
+            go_to_page(win, back)
+    return 0
+
+
+# ------------------------------------------------------------------------------------ prepare for a print
+# Under the Process box sit six tabs (Quality ... Others), each a scrolling list of label + value rows. Getting a
+# model ready is always the same few: lay it flat, infill down to what a test print needs, an infill pattern we
+# print, no brim, and supports only when Orca says the model has floating regions. Every change stays in the
+# session, exactly as if you had typed it in Orca: nothing here saves over a preset.
+PANEL_TABS = ("Quality", "Strength", "Speed", "Support", "Multimaterial", "Others")
+PANEL_VALUE_X = 358            # x through the value boxes
+PANEL_CHECK_X = 297            # x through the tick boxes
+PANEL_LABEL_RIGHT = 300        # labels stay left of this
+PANEL_SCROLL_X = 228           # x to put the wheel over: the label column, never a box that would take the notches
+PANEL_INK = 90                 # Orca greys out settings that do not apply (an unticked support's Type): read those too
+TEST_INFILL = 10               # a test print needs no more than 10%
+TEST_PATTERNS = ("Gyroid", "Cross Hatch", "Adaptive Cubic")      # the only infill patterns we print
+FLOATING = re.compile(r"float|support generation", re.I)         # Orca's warning when a model needs supports
+
+
+def panel_layout(win, headings):
+    """The Process tab row: its y and the x of each tab, read once per window size and sidebar layout."""
+    data, key = load_layout(), size_key(win)
+    cached = data.setdefault("panel", {}).get(key)
+    if cached and abs(cached.get("process", -1e9) - headings["process"]) < 1:
+        return cached
+    shot = Shot(win, 0, int(headings["process"]) + 56, 470, 68)
+    tabs, row = {}, None
+    for word in shot.words(threshold=PANEL_INK):
+        name = best_match(word["text"], list(PANEL_TABS), cutoff=0.8)
+        if name and name.lower() not in tabs:
+            tabs[name.lower()] = round(word["x"] + word["w"] / 2)
+            row = round(word["y"] + word["h"] / 2) if row is None else row
+    if len(tabs) < 4:
+        raise Stop("can't see Orca's process settings tabs (Quality, Strength, ...)")
+    found = {"process": headings["process"], "row": row, "tabs": tabs}
+    data.setdefault("panel", {})[key] = found
+    save_layout(data)
+    return found
+
+
+def panel_area(win, layout):
+    """Top and bottom of the settings under the tabs."""
+    return layout["row"] + 16, win["size"][1] - 8
+
+
+OPEN_TAB = [None]              # which settings tab was clicked last, so a row is remembered under its own tab
+
+
+def panel_open(win, layout, tab):
+    click(win, layout["tabs"][tab], layout["row"])
+    OPEN_TAB[0] = tab
+    VIEW[0] += 1
+    time.sleep(0.25)
+
+
+def remember_depth(win, label, notches):
+    """How far down its tab a setting sat, so the next run scrolls straight there instead of looking for it."""
+    data, key = load_layout(), size_key(win)
+    panel = data.setdefault("panel", {}).get(key)
+    if not panel:
+        return
+    panel.setdefault("depth", {})["%s/%s" % (OPEN_TAB[0], label)] = notches
+    save_layout(data)
+
+
+PARKED = [False]               # the pointer is off the settings and nothing has moved it since
+VIEW = [0, None, None]         # a counter bumped whenever the settings move, and the last reading of them
+
+
+def panel_quiet(win):
+    """Take the pointer off the settings before reading them: half a second resting on a row brings up Orca's
+    tooltip, and that covers the rows under it (the same tooltip that closes an open list). Once parked it
+    stays parked until something moves it, so this costs one move a run and not one a read."""
+    if PARKED[0]:
+        return
+    x, y = cursor()
+    if x - win["at"][0] < 470 and y - win["at"][1] > 80:
+        move_cursor(win["at"][0] + win["size"][0] - 30, win["at"][1] + 120)
+        time.sleep(0.15)
+    PARKED[0] = True
+
+
+def panel_scroll(win, layout, notches):
+    top, bottom = panel_area(win, layout)
+    wheel(win, PANEL_SCROLL_X, (top + bottom) // 2, notches)
+    VIEW[0] += 1
+    time.sleep(0.12)
+
+
+def panel_rows(win, layout, fresh=False):
+    """Every setting the open tab shows now: its label -> the y of its row. Only the label column is captured
+    (values sit right of PANEL_LABEL_RIGHT), and a reading is kept until the settings move: ticking a box does
+    not move them, so one reading answers several questions."""
+    if not fresh and VIEW[1] == VIEW[0] and VIEW[2] is not None:
+        return VIEW[2]
+    top, bottom = panel_area(win, layout)
+    panel_quiet(win)
+    shot = Shot(win, 0, top, PANEL_LABEL_RIGHT + 8, bottom - top)
+    rows = {}
+    for line in lines(shot.words(threshold=PANEL_INK)):
+        if line["right"] < PANEL_LABEL_RIGHT and re.search(r"[A-Za-z]", line["text"]):
+            rows.setdefault(squash(line["text"]), round(line["y"]))
+    VIEW[1], VIEW[2] = VIEW[0], rows
+    return rows
+
+
+def panel_find(win, layout, label, from_top=False):
+    """Scroll the open tab until `label` sits clear of the edges; its y, in window coordinates. Orca keeps each
+    tab where it was left, so a row that is not on screen is looked for from the top down: a notch moves the
+    settings about 60 px, and 5 at a time is under half the panel, which never steps over a row. Where each row
+    turned up is remembered, and tried first on the next run: two turns of the wheel instead of a search.
+    `from_top` takes the first one in the tab instead of the nearest: the Speed tab says Outer wall, Inner wall,
+    Sparse infill and Bridge twice, once as a speed and again down in Acceleration, and the speed is the one
+    above."""
+    top, bottom = panel_area(win, layout)
+    want = squash(label)
+
+    def ready(rows):
+        return want in rows and top + 18 <= rows[want] <= bottom - 18
+
+    rows = {} if from_top else panel_rows(win, layout)
+    if ready(rows):
+        return rows[want]
+    known = None if from_top else (layout.get("depth") or {}).get("%s/%s" % (OPEN_TAB[0], want))
+    if known is not None:
+        panel_scroll(win, layout, -30)                # the top of the tab, from wherever it was left
+        if known:
+            panel_scroll(win, layout, known)
+        rows = panel_rows(win, layout)
+        if ready(rows):
+            return rows[want]
+    if not from_top:
+        rows = panel_rows(win, layout, fresh=True)    # a tick can bring out a row that was not there before
+        if ready(rows):
+            return rows[want]
+    panel_scroll(win, layout, -30)                    # the top of the tab, however far down it was left
+    rows = panel_rows(win, layout, fresh=True)
+    depth = 0
+    for _ in range(14):                               # then down in steps that always overlap
+        if ready(rows):
+            layout.setdefault("depth", {})["%s/%s" % (OPEN_TAB[0], want)] = depth
+            remember_depth(win, want, depth)
+            return rows[want]
+        before = rows
+        panel_scroll(win, layout, 5)
+        depth += 5
+        rows = panel_rows(win, layout)
+        if rows == before:
+            break
+    if want in rows:                                  # there, but pressed against an edge
+        panel_scroll(win, layout, 1 if rows[want] > bottom - 18 else -1)
+        rows = panel_rows(win, layout)
+        if ready(rows):
+            return rows[want]
+    raise Stop("can't find %s in Orca's settings (it only shows some settings in Advanced mode)" % label)
+
+
+PANEL_BOX_X = 215              # the value box starts about here; labels start far left of it, however long they run
+
+
+def panel_arrow(win, y):
+    """The x of the orange arrow Orca draws on a row that no longer says what the preset says, or None. It sits
+    just left of the value box, and the value column is not in the same place on every tab (the Speed tab's boxes
+    sit about 45 px left of the Strength tab's), so it is looked for from the box leftwards: a changed setting
+    turns its label orange too, and that label is further left still."""
+    panel_quiet(win)
+    left = PANEL_BOX_X - 50
+    shot = Shot(win, left, y - 13, PANEL_VALUE_X - left, 26)
+    for dx in range(PANEL_VALUE_X - 2, left, -2):
+        for dy in range(int(y) - 9, int(y) + 6, 2):
+            r, g, b = shot.pixel(dx, dy)
+            if r > 170 and 60 < g < 160 and b < 90:
+                return dx - 10                        # the scan meets the arrow's right side; step back onto it
+    return None
+
+
+def panel_box_left(win, y):
+    """Where this row's value box starts, and where its revert arrow is (None when the row still says what the
+    preset says)."""
+    arrow = panel_arrow(win, y)
+    return (arrow + 16 if arrow is not None else PANEL_BOX_X), arrow
+
+
+def panel_box_lines(win, y, box, right=None, arrow=None, big=False):
+    """What this row says inside its value box. The revert arrow has to be painted out before Tesseract sees it,
+    not sorted out afterwards: it reads the arrow as a word of its own on one row ("> 11") and as part of the
+    number on the next ("D190", and a changed "10" as "210"). Cutting the picture at the box instead costs the
+    number its first digit, because Tesseract wants a margin of background in front of it."""
+    shot = Shot(win, 0, y - 13, (right or PANEL_VALUE_X + 80), 26)
+    said = shot.words(psm=7, threshold=PANEL_INK, big=big,
+                      blank=(arrow - 2, arrow + 16) if arrow is not None else None)
+    return lines([word for word in said if word["x"] + word["w"] > box])
+
+
+def panel_value(win, y, right=None, left=None, big=False):
+    """What the value box on this row reads. The whole row is captured and everything that starts in the box is
+    kept: a number sits at the left of its box and the unit at the right ("200" ... "mm/s"), while a label can run
+    most of the way to the box, so reading from a fixed x either cut the number off or swallowed the label.
+    `right` stops the capture short of what is written beside the box (the names down the side of a stack)."""
+    panel_quiet(win)
+    box, arrow = panel_box_left(win, y) if left is None else (left, None)
+    return " ".join(line["text"] for line in panel_box_lines(win, y, box, right, arrow, big)).strip()
+
+
+def panel_numbers(win, y, right=None):
+    """What the box on this row says, read twice: at the size it is on screen, and at twice that. Neither size
+    is right on its own - "11" comes back as "1" until it is enlarged, and an enlarged "32" comes back as "37" -
+    so both readings are kept and a number is believed when one of them is what we are looking for."""
+    said = []
+    for big in (False, True):
+        found = re.match(r"(\d+(?:[.,]\d+)?)\s*(%?)", panel_value(win, y, right, big=big))
+        if found:
+            said.append((float(found.group(1).replace(",", ".")), found.group(2)))
+    return said
+
+
+def panel_best(said):
+    """Which of the two readings to believe when they differ: the one that saw more digits, and the plain one
+    when both saw the same number of them. Enlarging brings out a digit the plain reading drops ("1" for "11"),
+    and it is also the reading that turns a 2 into a 7."""
+    if not said:
+        return None
+    if len(said) < 2 or said[0] == said[1]:
+        return said[0]
+    return max(said, key=lambda got: (len(str(int(got[0]))), got is said[0]))
+
+
+def panel_number(win, y, right=None):
+    """The number in the box on this row as (number, "%" or ""), or None when the box holds no number. Orca
+    takes a speed either in mm/s or as a percentage of another speed, and the two are set the same way."""
+    return panel_best(panel_numbers(win, y, right))
+
+
+def panel_caret_x(win, y, right=None):
+    """Where to click to get the caret into this row's box: on what the box already says. The boxes do not sit in
+    the same place on every tab, and the unit drawn inside the box's frame ("mm/s") is not part of the field, so a
+    click at one fixed x lands on the unit on some tabs and does nothing at all."""
+    panel_quiet(win)
+    box, arrow = panel_box_left(win, y)
+    said = panel_box_lines(win, y, box, right, arrow)
+    return int(said[0]["x"]) + 6 if said else box + 20
+
+
+def panel_type(win, layout, tab, y, text, right=None):
+    """Put a number in a value box. Orca ignores the Home, End and Backspace keys wtype sends (the same keys its
+    file window ignores), so a triple click does the selecting, the typing replaces what was selected, and a click
+    on the tab that is already open lets the box lose focus, which is what makes Orca take the number."""
+    wlrctl = tool("wlrctl")
+    move_cursor(win["at"][0] + panel_caret_x(win, y, right), win["at"][1] + int(y))
+    time.sleep(0.12)
+    run([wlrctl, "pointer", "move", "2", "0"])        # GTK wants real motion before a click
+    time.sleep(0.06)
+    run([wlrctl, "pointer", "move", "-2", "0"])
+    time.sleep(0.12)
+    for _ in range(3):
+        run([wlrctl, "pointer", "click", "left"])
+        time.sleep(0.07)
+    time.sleep(0.2)
+    run([tool("wtype"), str(text)])
+    time.sleep(0.2)
+    panel_open(win, layout, tab)
+
+
+def panel_pick(win, layout, y, option):
+    """Choose an option from the drop-down on this row (it opens under the box, or over it near the bottom)."""
+    top, _bottom = panel_area(win, layout)
+    click(win, PANEL_VALUE_X, y)
+    time.sleep(0.5)
+    shot = Shot(win, PANEL_VALUE_X - 60, max(top, y - ROW_STEP * 8), 230, ROW_STEP * 17)
+    want = squash(option)
+    for line in lines(shot.words(threshold=PANEL_INK)):
+        if squash(line["text"]) == want:
+            click(win, PANEL_VALUE_X, round(line["y"]))
+            time.sleep(0.45)
+            return True
+    click(win, PANEL_VALUE_X, y)                      # put the list away again
+    raise Stop("Orca's list has no %s" % option)
+
+
+def panel_ticked(win, y):
+    """Orca's tick boxes are teal with a white tick through them when they are on, and dark grey when they are
+    off, so it takes the whole box: the middle alone lands on the white tick as often as on the teal."""
+    panel_quiet(win)
+    shot = Shot(win, PANEL_CHECK_X - 9, y - 9, 19, 19)
+    green = sum(1 for dx in range(PANEL_CHECK_X - 6, PANEL_CHECK_X + 7, 2)
+                for dy in range(int(y) - 6, int(y) + 7, 2)
+                if shot.pixel(dx, dy)[1] - shot.pixel(dx, dy)[0] > 40)
+    return green >= 10
+
+
+def panel_tick(win, y, on=True):
+    if panel_ticked(win, y) != on:
+        click(win, PANEL_CHECK_X, y)
+        VIEW[0] += 1                                  # ticking one can bring another out (critical regions only)
+        time.sleep(0.3)
+    return panel_ticked(win, y) == on
+
+
+PANEL_REVERT_X = 281           # a fallback: the arrow sits beside the box, and the box moves from tab to tab
+# Orca only shows "Support critical regions only" while supports are on, so putting settings back goes
+# through it before Enable support, or the row is gone by the time we look for it.
+PREP_SETTINGS = (("strength", "Sparse infill density"), ("strength", "Sparse infill pattern"),
+                 ("others", "Brim type"), ("support", "Support critical regions only"),
+                 ("support", "On build plate only"), ("support", "Enable support"))
+
+
+def panel_changed(win, y, right=None):
+    """Orca draws an orange arrow next to every setting that differs from the preset."""
+    return panel_arrow(win, y) is not None
+
+
+def panel_revert(win, y, right=None):
+    """Put a changed setting back to what the preset says. Orca has no undo for settings: Ctrl+Z moves objects
+    back but leaves every changed setting where it is, so this arrow is the way back."""
+    arrow = panel_arrow(win, y)
+    if arrow is None:
+        return False
+    click(win, arrow + 5, y - 3)
+    time.sleep(0.5)
+    return not panel_changed(win, y)
+
+
+GRAMS_PER_METRE = 2.98         # 1.75 mm filament at about 1.24 g/cm3: close enough to catch a misread
+
+
+def support_weight(win):
+    """How many grams of support Orca's Preview legend counts, or None when there is no support row. The
+    legend's columns sit far apart, so a row's words only join with a wide gap. Tesseract drops the point out
+    of the weight often enough ("3.91g" read as "391g") that the row's own length is used to check it: a metre
+    of filament is about 3 g, and a weight that disagrees with its length is the one that was misread."""
+    shot = Shot(win, int(win["size"][0] * 0.60), 20, int(win["size"][0] * 0.40) - 8, 700)
+    for line in lines(shot.words(), gap=400):
+        if not re.match(r"^Support\b(?!\s+interface)", line["text"]):
+            continue
+        grams = re.findall(r"([\d.]+)\s*g\b", line["text"])
+        metres = re.findall(r"([\d.]+)\s*m\b", line["text"])
+        if not grams:
+            return None
+        weight = float(grams[-1])
+        if metres:
+            expected = float(metres[-1]) * GRAMS_PER_METRE
+            if expected and not (0.6 * expected <= weight <= 1.6 * expected):
+                shifted = weight
+                for _ in range(4):                        # put the point back where the reading lost it
+                    shifted /= 10.0
+                    if 0.6 * expected <= shifted <= 1.6 * expected:
+                        return round(shifted, 2)
+                return round(expected, 2)
+        return weight
+    return None
+
+
+def slicing_warning(win):
+    """Orca's warning card at the bottom right of the 3D view, as one line ("" when there is none)."""
+    w, h = win["size"]
+    shot = Shot(win, int(w * 0.55), max(0, h - 260), int(w * 0.45) - 12, min(250, h))
+    return " ".join(line["text"] for line in lines(shot.words())).strip()
+
+
+def cmd_prep_revert():
+    """Put the settings prep changes back to what the preset says, and leave everything else alone."""
+    win = orca_window()
+    focus(win)
+    headings = sidebar(win)
+    layout = panel_layout(win, headings)
+    back = []
+    for tab, label in PREP_SETTINGS:
+        panel_open(win, layout, tab)
+        try:
+            found = panel_find(win, layout, label)
+        except Stop:
+            continue                                  # a setting Orca is not showing is one it is not using either
+        if panel_revert(win, found):
+            back.append(label.lower().replace("sparse ", ""))
+    notify("Orca", ("back to the preset: %s" % ", ".join(back)) if back else "nothing to put back")
+    return 0
+
+
+def least_supports(win, layout):
+    """Set supports to the least we ever use — tree, from the plate only, critical regions only — and say which
+    of those had to be changed. With these on, what Orca generates is what the model really needs: its overhang
+    warning alone says nothing, because it fires for overhangs Orca then prints perfectly well."""
+    changed = []
+    panel_open(win, layout, "support")
+    if not panel_ticked(win, panel_find(win, layout, "Enable support")):
+        panel_tick(win, panel_find(win, layout, "Enable support"), True)
+        changed.append("Enable support")
+    y = panel_find(win, layout, "Type")
+    if "tree" not in panel_value(win, y).lower():
+        panel_pick(win, layout, y, "Tree (auto)")
+        changed.append("Type")
+    for label in ("On build plate only", "Support critical regions only"):
+        y = panel_find(win, layout, label)
+        if not panel_ticked(win, y):
+            panel_tick(win, y, True)
+            changed.append(label)
+    return changed
+
+
+def weigh_supports(win):
+    """Slice and come back with (grams of support, Orca's warning)."""
+    slice_first(win)
+    return support_weight(win) or 0.0, slicing_warning(win)
+
+
+def cmd_prep(infill=TEST_INFILL, orient=True):
+    """Get what is on the plate ready for a test print: infill no higher than `infill`% in one of the patterns we
+    print, no brim, and as few supports as the model can be made to need — only ever from the plate, never
+    standing on the model. Nothing is turned until Orca has weighed both ways up: its own auto orient laid the
+    turtle down and gave it 0.35 g of support that the model did not need standing up. It never saves over a
+    preset and never sends anything."""
+    win = orca_window()
+    focus(win)
+    if printable_on_plate() == 0:
+        raise Stop("nothing on this plate to prepare: put a model on it (o)")
+    go_to_page(win, "prepare")
+    time.sleep(0.3)
+    done = []
+    headings = sidebar(win)
+    layout = panel_layout(win, headings)
+
+    panel_open(win, layout, "strength")
+    y = panel_find(win, layout, "Sparse infill density")
+    now = re.sub(r"[^0-9]", "", panel_value(win, y))
+    if not now or int(now) > infill:                  # a lower infill than the test one is left alone
+        panel_type(win, layout, "strength", y, infill)
+        y = panel_find(win, layout, "Sparse infill density")
+        got = re.sub(r"[^0-9]", "", panel_value(win, y))
+        if got != str(infill):
+            raise Stop("could not set the infill to %d%% (Orca shows %s)" % (infill, got or "nothing"))
+        done.append("infill %d%%" % infill)
+    y = panel_find(win, layout, "Sparse infill pattern")
+    if not best_match(panel_value(win, y), list(TEST_PATTERNS), cutoff=0.9):   # "Grid" is 0.8 like "Gyroid"
+        panel_pick(win, layout, y, TEST_PATTERNS[0])
+        done.append("%s infill" % TEST_PATTERNS[0].lower())
+
+    panel_open(win, layout, "others")
+    y = panel_find(win, layout, "Brim type")
+    if squash(panel_value(win, y)) != squash("No-brim"):
+        panel_pick(win, layout, y, "No-brim")
+        done.append("no brim")
+
+    support_changes = least_supports(win, layout)
+    notify("Orca", "getting the plate ready: slicing to see what it needs")
+    grams, warning = weigh_supports(win)
+
+    if grams > 0 and orient:
+        # Worth asking Orca for another way up, but only worth keeping if it weighs less. Its auto orient is
+        # built to minimise support and still gets this wrong: on the turtle it made support out of nothing.
+        look, watch = canvas_look(win), OrcaLog()
+        notify("Orca", "it wants %.2f g of support: trying another way up" % grams)
+        orca_shortcut(win, "", "Q")
+        wait_for(lambda: watch.contains("orientation:"), 15, step=0.2)
+        time.sleep(1.0)
+        if canvas_look(win) != look:                  # it did turn it: weigh that way up too
+            turned_grams, turned_warning = weigh_supports(win)
+            if turned_grams < grams:
+                done.append("turned it: %.2f g of support instead of %.2f g" % (turned_grams, grams))
+                grams, warning = turned_grams, turned_warning
+            else:
+                undo_orient(win)
+                grams, warning = weigh_supports(win)
+                done.append("left it the way it was: turning it wanted %.2f g instead of %.2f g"
+                            % (turned_grams, grams))
+
+    if grams > 0 and FLOATING.search(warning):        # critical regions were not enough: the whole tree, still from the plate
+        panel_open(win, layout, "support")
+        panel_tick(win, panel_find(win, layout, "Support critical regions only"), False)
+        support_changes = [c for c in support_changes if c != "Support critical regions only"]
+        grams, warning = weigh_supports(win)
+        done.append("supports from the plate: the whole tree, critical regions alone left parts floating")
+    elif grams > 0:
+        done.append("supports from the plate: tree, critical regions only")
+    elif support_changes:
+        # It needs none, so the support settings go back to your preset and the plate is sliced as it will print.
+        panel_open(win, layout, "support")
+        for label in ("Support critical regions only", "On build plate only", "Type", "Enable support"):
+            if label in support_changes:
+                panel_revert(win, panel_find(win, layout, label))
+        slice_first(win)
+        warning = slicing_warning(win)
+        done.append("no supports: Orca makes 0.00 g of them for this model")
+
+    told = ", ".join(done) or "it was ready as it was"
+    if grams > 0 and FLOATING.search(warning):
+        # Everything the plate can reach is already carried, so what is left would need supports standing on the
+        # model. That is a choice about marks on the model, so it stops here and says so instead of ticking it off.
+        notify("Orca", "%s. Orca still says something floats: carrying it would mean supports standing on the "
+                       "model, so that one is yours — turn it yourself, or change the model." % told.capitalize(),
+               seconds=12)
+    else:
+        weighed = (" The supports weigh %.2f g." % grams) if grams else ""
+        extra = " Orca flags overhangs on it, but it makes no support for them, so they print as they are." \
+            if (not grams and FLOATING.search(warning)) else ""
+        notify("Orca", "Ready for a test print: %s.%s%s Your presets are untouched." % (told, weighed, extra), seconds=10)
+    return 0
+
+
+
+def canvas_look(win):
+    """A rough fingerprint of the 3D view: same number, nothing moved. It says whether Orca's auto orient
+    actually turned anything, so nothing is sliced again or undone for a turn that never happened."""
+    shot = Shot(win, int(win["size"][0] * 0.45), 100, int(win["size"][0] * 0.5), 500)
+    return hash(shot.pixels[::997])
+
+
+def undo_orient(win):
+    """Put a model back the way it was standing. Orca undoes object moves (it does not undo settings), and the
+    canvas has to have the keys for Ctrl+Z to reach it. If the undo took the model off the plate instead, it is
+    put straight back: an undo that goes one step too far would otherwise leave an empty plate."""
+    watch = OrcaLog()
+    go_to_page(win, "prepare")
+    time.sleep(0.3)
+    click(win, int(win["size"][0] * 0.78), int(win["size"][1] * 0.22))     # empty sky in the 3D view
+    time.sleep(0.4)
+    orca_shortcut(win, "CTRL", "Z")
+    wait_for(lambda: watch.contains("Undo / Redo snapshot reloaded"), 8, step=0.2)
+    time.sleep(0.8)
+    if printable_on_plate() == 0:
+        orca_shortcut(win, "CTRL+SHIFT", "Z")
+        time.sleep(1.2)
+        raise Stop("the undo emptied the plate, so it was put back; prepare it again")
+
+
+def selfcheck_cube(path, size=20.0):
+    """A closed 20 mm cube as binary STL."""
+    h = size / 2
+    corners = [(x, y, z) for x in (-h, h) for y in (-h, h) for z in (0, size)]
+    sides = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    tris = [[corners[i][k] for i in t for k in range(3)] for a, b, c, d in sides for t in ((a, b, c), (a, c, d))]
+    with open(path, "wb") as out:
+        out.write(b"maker-orca selfcheck".ljust(80, b" ") + struct.pack("<I", len(tris)))
+        for t in tris:
+            out.write(struct.pack("<12fH", 0, 0, 0, *t, 0))
+    return path
+
+
+def cmd_selfcheck():
+    """The Orca keys against the real Orca, on an empty plate, leaving it as it was: pages, a model in over D-Bus, slicing,
+    the print window and its printer list and verdict, closing it, undo. Nothing is sent and no choice is changed."""
+    results, started = [], time.time()
+
+    def step(name, action):
+        t = time.time()
+        try:
+            detail = action()
+            results.append((True, name, detail, time.time() - t))
+            return True
+        except Stop as problem:
+            results.append((False, name, str(problem), time.time() - t))
+            return False
+
+    win = orca_window()
+    focus(win)
+    if printable_on_plate() not in (0, None):
+        raise Stop("the self-check needs an empty plate; put your models away first")
+    tabs = tabs_for(win)
+    back = selected_page(tab_strip(win), {k: v for k, v in tabs.items() if k in PAGES})
+    cube = selfcheck_cube(os.path.join(ENV["XDG_RUNTIME_DIR"], "maker-selfcheck.stl"))
+    imported = False
+    try:
+        ok = step("pages", lambda: (go_to_page(win, "preview"), go_to_page(win, "prepare"), "Preview and Prepare")[2])
+        ok = ok and step("model in over D-Bus", lambda: (cmd_import([cube], quiet=True), "a 20 mm cube")[1])
+        imported = ok
+        ok = ok and step("Orca counts it", lambda: "1 object" if wait_for(lambda: printable_on_plate() == 1, 5, step=0.3)
+                         else (_ for _ in ()).throw(Stop("Orca's log did not count the cube")))
+
+        def print_window():
+            dialog, log = open_send_dialog(orca_window())
+            if not dialog:
+                raise Stop("Orca opened something else instead of its print window")
+            try:
+                names, current, _heading = read_printers(dialog)
+                status, settled = settled_status(log, 25)
+                return "%s; %s selected; Orca says %s" % (", ".join(names), current, status_words(status) if status else "nothing yet")
+            finally:
+                close_send_dialog(dialog)
+
+        ok and step("slice, print window, printers", print_window)
+    finally:
+        if imported:
+            def undo():
+                if send_dialog():
+                    close_send_dialog(send_dialog())
+                w = orca_window()
+                go_to_page(w, "prepare")
+                click(w, w["size"][0] - 70, 150, settle=0.06)     # the empty 3D view takes the keyboard
+                orca_shortcut(w, "CTRL", "Z")
+                if wait_for(lambda: printable_on_plate() == 0, 4, step=0.3):
+                    return "plate empty again"
+                click(w, *UNDO_BUTTON, settle=0.06)               # the title bar's undo arrow, if the key did not land
+                if not wait_for(lambda: printable_on_plate() == 0, 6, step=0.3):
+                    raise Stop("the cube is still on the plate; Undo it in Orca")
+                return "plate empty again"
+            step("undo", undo)
+        if back and back != "prepare":
+            go_to_page(orca_window(), back)
+        os.remove(cube)
+    passed = sum(1 for r in results if r[0])
+    for good, name, detail, took in results:
+        print("%s %-30s %5.1fs  %s" % ("ok  " if good else "FAIL", name, took, detail))
+    summary = "%d of %d passed in %.0f s" % (passed, len(results), time.time() - started)
+    print(summary)
+    failed = next((r for r in results if not r[0]), None)
+    notify("Orca keys self-check", summary if not failed else "%s: %s failed: %s" % (summary, failed[1], failed[2]), seconds=12)
+    return 0 if not failed else 1
+
+
+# ------------------------------------------------------------------------------------------------ models
+MODEL_TYPES = (".stl", ".3mf", ".step", ".stp", ".obj", ".amf", ".svg")
+MESHY_OUT = os.path.expanduser(os.environ.get("MESHY_OUT", "~/Projects/3D_Exports/meshy"))
+MODEL_FOLDERS = tuple(os.environ.get("MAKER_MODEL_FOLDERS", "~/Downloads:~/Projects/3D_Exports:~/Desktop").split(":"))
+PICTURE_FOLDERS = tuple(os.environ.get("MAKER_PICTURE_FOLDERS", "~/Pictures:~/Downloads:~/Desktop").split(":"))
+
+
+ORCA_BUS = "com.orcaslicer.OrcaSlicer.InstanceCheck.Object"   # + a hash of Orca's path; on the session bus while Orca runs
+
+
+def orca_bus_name():
+    """The D-Bus name a running Orca listens on for files sent by a second copy of itself. Orca listens on Linux
+    whatever its single-instance setting (InstanceCheck.cpp, BACKGROUND_MESSAGE_LISTENER)."""
+    proc = subprocess.run(["busctl", "--user", "list", "--no-legend", "--acquired"], capture_output=True, text=True, env=ENV, timeout=10)
+    names = [(line.split() or [""])[0] for line in proc.stdout.splitlines()]
+    return next((n for n in names if n.startswith(ORCA_BUS)), None)
+
+
+def orca_message(paths):
+    """The command line Orca's second copy would send: strings joined by ';', any string with a space, tab, quote,
+    backslash, newline or ';' in double quotes with backslash escapes (Orca's escape_strings_cstyle)."""
+    words = []
+    for text in ["orca-slicer"] + list(paths):
+        if any(c in text for c in ' \t\\"\r\n;'):
+            text = '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
+        words.append(text)
+    return ";".join(words)
+
+
+def cmd_import(paths, only_if_running=False, quiet=False):
+    """Put model files on Orca's plate. Orca gets them the way a second Orca would hand them over (D-Bus): no file
+    window, no keys, no focus change. Orca shows its own Loading window and asks its own questions (projects, parts)."""
+    paths = [os.path.abspath(os.path.expanduser(p)) for p in paths]
+    for path in paths:
+        if not os.path.isfile(path):
+            raise Stop("no such file: %s" % path)
+        if not path.lower().endswith(MODEL_TYPES):
+            raise Stop("Orca takes %s files, not %s" % (" ".join(MODEL_TYPES), os.path.basename(path)))
+    names = ", ".join(os.path.splitext(os.path.basename(p))[0] for p in paths)
+    bus = orca_bus_name()
+    if not bus:
+        if only_if_running:
+            return 3
+        if orca_windows():
+            raise Stop("this Orca doesn't take files from outside; use Ctrl+I in Orca")
+        maker_run = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-run")
+        subprocess.Popen([maker_run, "orca"] + paths, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        notify("Orca", "opening OrcaSlicer with %s" % names)
+        return 0
+    loading = lambda: [c for c in orca_dialogs() if (c.get("title") or "").startswith("Loading")]
+    wait_for(lambda: not loading(), 90, step=0.3)    # another model still loading: wait for it, it is no question
+    asking = [c.get("title") or "a window" for c in orca_dialogs()]
+    if asking:                                  # a model landing now would change what that window is about
+        raise Stop("Orca has %s open; close it, then put %s on the plate" % (", ".join(repr(t) for t in asking), names))
+    log = OrcaLog()
+    message = orca_message(paths)
+    run(["busctl", "--user", "call", "--expect-reply=no", bus, "/" + bus.replace(".", "/"), bus, "AnotherInstance", "s", message])
+    if not wait_for(lambda: log.contains("message from other instance: " + message), 4, step=0.1):
+        # Orca keeps the D-Bus name but stops listening when it was started while another copy was up
+        # ("Not primary owner of DBus name" in its log), so the name alone does not mean anyone is home.
+        raise Stop("Orca is not listening for models (it was started more than once); restart Orca and try again")
+    # Orca shows "Loading..." while it reads the file, then the objects land (logged), or it asks something first
+    deadline, loaded, quiet_since = time.time() + 180, False, None
+    while time.time() < deadline:
+        if log.contains("after add_objects_to_list"):
+            loaded = True
+            break
+        titles = [c.get("title") or "a question" for c in orca_dialogs()]
+        questions = [t for t in titles if not t.startswith("Loading")]
+        if questions:
+            notify("Orca is asking", "%s: answer it in Orca" % ", ".join(questions), seconds=8)
+            return 4
+        quiet_since = None if titles else (quiet_since or time.time())
+        if quiet_since and time.time() - quiet_since > 5:
+            break
+        time.sleep(0.2)
+    if not quiet:
+        notify("Orca", ("%s on the plate" if loaded else "Orca took %s") % names)
+    return 0
+
+
+def meshy_models():
+    models = []
+    for meta in glob.glob(os.path.join(MESHY_OUT, "*", "meshy.json")):
+        try:
+            record = json.load(open(meta))
+        except (OSError, ValueError):
+            continue
+        if record.get("model") and os.path.exists(record["model"]):
+            models.append(record)
+    return sorted(models, key=lambda r: os.path.getmtime(r["model"]), reverse=True)
+
+
+def recent_models(limit=40):
+    """(path, label, subtext) for model files: Meshy's first, then everything else by date."""
+    seen, rows = set(), []
+    for record in meshy_models():
+        size = " × ".join(str(v) for v in record.get("size_mm") or [])
+        rows.append((os.path.getmtime(record["model"]) + 1e9, record["model"], record["name"], "Meshy · %s mm" % size))
+        seen.add(os.path.realpath(record["model"]))
+    candidates = []
+    for folder in MODEL_FOLDERS:
+        root = os.path.expanduser(folder)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath[len(root):].count(os.sep) >= 3:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and os.path.join(dirpath, d) != MESHY_OUT]
+            candidates += [os.path.join(dirpath, f) for f in filenames if f.lower().endswith(MODEL_TYPES)]
+    try:
+        conf = json.load(open(os.path.join(ORCA_CONFIG, "OrcaSlicer.conf")))
+        recent = conf.get("recent_projects") or {}
+        candidates += list(recent.values()) if isinstance(recent, dict) else list(recent)
+    except (OSError, ValueError):
+        pass
+    for path in candidates:
+        real = os.path.realpath(path)
+        if real in seen or not os.path.isfile(real) or "/_selftest/" in real:
+            continue
+        seen.add(real)
+        when = datetime.datetime.fromtimestamp(os.path.getmtime(real)).strftime("%b %d %H:%M")
+        rows.append((os.path.getmtime(real), real, os.path.basename(real), "%s · %s" % (os.path.basename(os.path.dirname(real)), when)))
+    rows.sort(reverse=True)
+    return [(path, label, sub) for _when, path, label, sub in rows[:limit]]
+
+
+def unique_labels(rows):
+    """Menu rows for (path, label, subtext) with every label different: the menu hands back only the label."""
+    options, by_label = [], {}
+    for path, label, sub in rows:
+        unique, n = label, 2
+        while unique in by_label:
+            unique, n = "%s (%d)" % (label, n), n + 1
+        by_label[unique] = path
+        options.append((unique, sub, MODEL_ICON))
+    return options, by_label
+
+
+def choose_model(prompt, rows):
+    options, by_label = unique_labels(rows)
+    return by_label.get(menu(prompt, options))
+
+
+def meshy_record(path):
+    """meshy.json for a model maker-meshy made (the model itself, or a sized copy next to it), else None."""
+    meta = os.path.join(os.path.dirname(path), "meshy.json")
+    if os.path.dirname(os.path.dirname(os.path.realpath(path))) != os.path.realpath(MESHY_OUT) or not os.path.isfile(meta):
+        return None
+    try:
+        with open(meta) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def at_height(path):
+    """A Meshy model at the height you pick (a sized copy), the model as made, or None when the menu was closed."""
+    record = meshy_record(path)
+    if not record or not record.get("size_mm"):
+        return path
+    made = "As made: %s mm" % " × ".join(str(v) for v in record["size_mm"])
+    choice = menu("How tall", [(made, "the model as Meshy's job left it", SIZE_ICON)]
+                  + [(label, sub, SIZE_ICON) for label, sub in SIZES if label.endswith("mm tall")])
+    if not choice:
+        return None
+    if choice == made:
+        return path
+    tool_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-meshy")
+    out = subprocess.run([tool_path, "size", os.path.dirname(path), size_args(choice)[1]], capture_output=True, text=True, env=ENV)
+    if out.returncode != 0 or not os.path.isfile(out.stdout.strip()):
+        raise Stop("couldn't size %s: %s" % (record.get("name"), (out.stderr or out.stdout).strip()[-200:]))
+    return out.stdout.strip()
+
+
+def cmd_open():
+    rows = recent_models()
+    if not rows:
+        raise Stop("no model files in %s yet" % ", ".join(MODEL_FOLDERS))
+    path = choose_model("Put on the plate", rows)
+    path = at_height(path) if path else None
+    return cmd_import([path]) if path else 0
+
+
+KIT_SCALES = (("As made", "the size the file has"), ("150%", "half again as big"), ("200%", "twice as big"),
+              ("120%", "a fifth bigger"))
+
+
+def maker_blender(args, timeout=1800):
+    """Blender does the geometry a slicer cannot: cutting a model into parts that slot together."""
+    tool_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-blender")
+    if not os.access(tool_path, os.X_OK):
+        raise Stop("maker-blender is missing; run maker doctor")
+    out = subprocess.run([tool_path] + args, capture_output=True, text=True, env=ENV, timeout=timeout)
+    if out.returncode != 0:
+        raise Stop((out.stderr or out.stdout).strip().splitlines()[-1][:200] if (out.stderr or out.stdout)
+                   else "Blender could not do that")
+    return out.stdout
+
+
+# --------------------------------------------------------------------------------- the plate's own menu
+# Right-clicking the plate opens Orca's menu for the whole project: Select All, Select All Plates, Delete All,
+# Arrange, Delete Plate, Add Models. The keys only ever reach the plate in front of you (Ctrl+A stops there, and
+# Ctrl+Del does nothing at all), so anything that has to reach every plate goes through this menu.
+PLATE_MENU = ("Select All", "Select All Plates", "Delete All", "Arrange", "Reload All", "Auto Rotate",
+              "Delete Plate", "Add Primitive", "Add Handy models", "Add Models", "Replace all with 3D files...",
+              "Lock", "Edit Plate Name")
+
+
+def right_click(win, dx, dy, settle=0.05):
+    """Right click at a point inside Orca's window: the plate menu opens under the pointer."""
+    x, y = win["at"][0] + int(dx), win["at"][1] + int(dy)
+    if not (0 <= dx < win["size"][0] and 0 <= dy < win["size"][1]):
+        raise Stop("that spot is outside Orca's window")
+    other = covered(win, x, y)
+    if other:
+        raise Stop("%s is covering Orca" % other)
+    wlrctl = tool("wlrctl")
+    PARKED[0] = False
+    move_cursor(x, y)
+    time.sleep(settle)
+    run([wlrctl, "pointer", "move", "2", "0"])        # GTK wants real motion before a click
+    time.sleep(settle)
+    run([wlrctl, "pointer", "move", "-2", "0"])
+    time.sleep(settle * 1.25)
+    run([wlrctl, "pointer", "click", "right"])
+
+
+def menu_items(found):
+    """The plate-menu rows among these lines, by name. The menu is only believed when several of its rows are
+    there at once: one word read off the 3D view is not a menu."""
+    known = {squash(name): name for name in PLATE_MENU}
+    rows = {}
+    for line in found:
+        name = known.get(squash(line["text"])) or best_match(line["text"], PLATE_MENU, cutoff=0.9)
+        if name and name not in rows:
+            rows[name] = line
+    return rows if len(rows) >= 4 else {}
+
+
+def menu_rows(win):
+    """The rows of the open plate menu, in window coordinates."""
+    shot = Shot(win, 0, 0, win["size"][0], win["size"][1])
+    return menu_items(lines(shot.words(psm=6, min_conf=30)))
+
+
+# Where to look for an empty piece of the bed. Off the bed Orca offers a short menu (Add Primitive, Add Models)
+# and on a model it offers that model's own menu; only bare bed gives the menu for the project. Which part of the
+# screen is bare bed depends on where the camera is and what is loaded, so these spots are tried in turn.
+PLATE_SPOTS = ((0.55, 0.62), (0.45, 0.72), (0.72, 0.68), (0.62, 0.48), (0.38, 0.55), (0.76, 0.30))
+
+
+def plate_menu(win, item):
+    """Pick a row from the plate's own menu. Anything that has to reach the whole project - every plate, not just
+    the one in front of you - goes through here."""
+    focus(win)
+    go_to_page(win, "prepare")
+    time.sleep(0.3)
+    for across, down in PLATE_SPOTS:
+        right_click(win, int(win["size"][0] * across), int(win["size"][1] * down))
+        time.sleep(0.9)
+        rows = menu_rows(win)
+        if item in rows:
+            row = rows[item]
+            click(win, int(row["x"] + 12), int(row["y"]))
+            time.sleep(0.6)
+            return True
+        orca_shortcut(win, "", "Escape")              # close whatever opened, then try another piece of bed
+        time.sleep(0.4)
+    raise Stop("could not find a bare piece of plate to ask %r from" % item)
+
+
+def cmd_clear(ask=True):
+    """Take everything off every plate. Ctrl+A, and even Orca's own Delete All, stop at the plate in front of you,
+    so a model left on a second plate used to survive a clear and then turn up in the next slice; Select All
+    Plates is the one that reaches the whole project. Orca's Ctrl+Z puts it all back, and this asks first
+    because a plate is sometimes an afternoon's arranging."""
+    win = orca_window()
+    focus(win)
+    plates = plate_count() or 1
+    on_plate = printable_on_plate()
+    if on_plate == 0 and plates < 2:
+        notify("Orca", "the plate is already empty")
+        return 0
+    if ask:
+        count = "%d model%s" % (on_plate, "" if on_plate == 1 else "s") if on_plate else "everything"
+        if plates > 1:
+            count += " and whatever is on the other %d plate%s" % (plates - 1, "" if plates == 2 else "s")
+        if menu("Take %s off?" % count, [("Clear the plate", "Ctrl+Z in Orca puts it back", CHECK),
+                                         ("Keep it", None, None)]) != "Clear the plate":
+            return 0
+    plate_menu(win, "Select All Plates")
+    time.sleep(0.6)
+    orca_shortcut(win, "", "Delete")
+    if not wait_for(lambda: printable_on_plate() == 0, 10, step=0.4):
+        raise Stop("Orca did not empty the plate")
+    notify("Orca", "plate cleared" if plates < 2 else "%d plates cleared" % plates)
+    return 0
+
+
+def spread_out(win):
+    """Lay the parts out side by side. Every part comes out of the cut where it stood in the whole model, so they
+    land one inside another - an assembled wizard, and a plate Orca will not slice. Orca's own Arrange spreads
+    them, and opens a second plate when they do not all fit on one."""
+    watch = OrcaLog()
+    plate_menu(win, "Arrange")
+    if not wait_for(lambda: watch.contains("snapshot taken: Arrange"), 30, step=0.3):
+        raise Stop("Orca did not arrange the plate")
+    time.sleep(1.0)
+
+
+# ------------------------------------------------------------------------------------------- speeds
+# Christian, 2026-09-16: "slow stuff down ever so slightly. put bridges ever so slightly slower and overhangs
+# ever so slightly faster." A touch off every printing speed, a little more off the bridges (they have nothing
+# under them, and a slower bridge sags less), and the overhang speeds up instead - they are already the slowest
+# moves on the plate, and creeping over an overhang leaves the nozzle sitting in melted plastic.
+# Travel and the accelerations are left alone: neither lays down plastic.
+SPEED_TOUCH = 0.95             # a touch slower
+SPEED_BRIDGE = 0.90            # bridges slower still
+SPEED_OVERHANG = 1.05          # overhangs a touch quicker
+SPEED_SLOT_X = 372             # the names down the side of a stack of boxes (10% ... 75%, External, Internal)
+
+# What we touch: the speeds you can see on the finished print. Christian, 2026-09-16: "i only care about the
+# important speeds. the speeds that are for inside or supports im not worried about" - so infill, inner walls,
+# internal bridges and supports are left exactly as the preset has them.
+# label in the Speed tab, the name beside its box when several share a label, how much of what it says now
+SPEEDS = (("First layer", None, SPEED_TOUCH),          # the face it prints against the plate
+          ("Outer wall", None, SPEED_TOUCH),           # the surface you actually look at
+          ("Top surface", None, SPEED_TOUCH),
+          ("Overhang speed", "25%", SPEED_OVERHANG),
+          ("Overhang speed", "50%", SPEED_OVERHANG),
+          ("Overhang speed", "75%", SPEED_OVERHANG),
+          ("Bridge", "External", SPEED_BRIDGE))       # the ones that show; internal bridges are inside
+
+
+def panel_slots(win, layout):
+    """The names written down the side of a stack of boxes -> the y of the box each one names."""
+    top, bottom = panel_area(win, layout)
+    panel_quiet(win)
+    shot = Shot(win, SPEED_SLOT_X - 20, top, 150, bottom - top)
+    found = {}
+    for line in lines(shot.words(threshold=PANEL_INK)):
+        if line["x"] >= SPEED_SLOT_X:                 # left of that is the tail of the unit ("mm/s or %")
+            found.setdefault(squash(line["text"]), round(line["y"]))
+    return found
+
+
+def panel_find_slot(win, layout, name):
+    """Scroll until the box named `name` sits clear of the edges, and give back its y. Overhang speed is four
+    boxes under one label and Bridge is two, so the label alone cannot say which box is meant; the name written
+    beside each box can."""
+    top, bottom = panel_area(win, layout)
+    want = squash(name)
+
+    def ready(slots):
+        return want in slots and top + 18 <= slots[want] <= bottom - 18
+
+    slots = panel_slots(win, layout)
+    if ready(slots):
+        return slots[want]
+    panel_scroll(win, layout, -30)                    # from the top of the tab down, in overlapping steps
+    for _ in range(14):
+        slots = panel_slots(win, layout)
+        if ready(slots):
+            return slots[want]
+        before = slots
+        panel_scroll(win, layout, 5)
+        if panel_slots(win, layout) == before:
+            break
+    raise Stop("can't find the %s box in Orca's speeds" % name)
+
+
+def speed_row(win, layout, label, slot):
+    """Find one speed and read it: (its y, what the box read at both sizes), or None when Orca leaves it empty.
+    Found one at a time and set straight away - every find scrolls the tab, so a y read before the next find is
+    no longer the row it was (that is how a first-layer speed once landed in the overhang box)."""
+    y = panel_find_slot(win, layout, slot) if slot else panel_find(win, layout, label, from_top=True)
+    said = panel_numbers(win, y, right=SPEED_SLOT_X - 8)
+    return (y, said) if said else None
+
+
+def cmd_speeds(revert=False):
+    """Take a touch off every printing speed, a little more off the bridges, and give the overhangs a touch back.
+    Nothing is saved: these are the same session-only changes prep makes, and the orange arrow (or --revert) puts
+    them back."""
+    win = orca_window()
+    focus(win)
+    headings = sidebar(win)
+    layout = panel_layout(win, headings)
+    panel_open(win, layout, "speed")
+    if revert:
+        back = []
+        for label, slot, _factor in SPEEDS:
+            try:
+                y = panel_find_slot(win, layout, slot) if slot else panel_find(win, layout, label, from_top=True)
+            except Stop:
+                continue
+            if panel_revert(win, y, right=SPEED_SLOT_X - 8):
+                back.append(("%s %s" % (label, slot)).lower() if slot else label.lower())
+        notify("Orca", ("speeds back to the preset: %s" % ", ".join(back)) if back else "no speed was changed")
+        return 0
+    changed = []
+    for label, slot, factor in SPEEDS:
+        name = ("%s %s" % (label.replace(" speed", ""), slot)).lower() if slot else label.lower()
+        found = speed_row(win, layout, label, slot)
+        if not found:
+            continue                                  # a box Orca leaves empty is one it is not using
+        y, said = found
+        now, unit = panel_best(said)
+        if now <= 0:                                  # 0 means Orca is not using this speed at all
+            continue
+        want = max(1, int(round(now * factor)))
+        if want == int(round(now)):                   # a small number whose touch rounded away: move it one
+            want = int(round(now)) + (1 if factor > 1 else -1 if factor < 1 else 0)
+        if want == int(round(now)) or want < 1:
+            continue
+        panel_type(win, layout, "speed", y, "%d%s" % (want, unit), right=SPEED_SLOT_X - 8)
+        time.sleep(0.4)                               # Orca takes the number a moment after the box loses focus
+        def took():
+            after = speed_row(win, layout, label, slot)
+            return after and any(int(round(value)) == want for value, _unit in after[1]), after
+
+        landed, after = took()
+        if not landed:
+            time.sleep(0.6)                           # a second look, in case the caret was still in the box
+            landed, after = took()
+        if not landed:
+            raise Stop("could not set %s to %d (Orca shows %s)"
+                       % (name, want, after[1][0][0] if after else "nothing"))
+        changed.append("%s %g%s to %d%s" % (name, now, unit, want, unit))
+    if not changed:
+        notify("Orca", "the speeds are already set that way")
+        return 0
+    notify("Orca", "a touch slower, bridges slower still, overhangs a touch quicker: %s. Your presets are "
+                   "untouched." % "; ".join(changed), seconds=16)
+    return 0
+
+
+def cmd_kit():
+    """Cut a model into parts that each print with a flat face down and slot together on a hidden spigot, then
+    put every part on the plate. The cutting is Blender's (maker-blender split); this asks what to cut and
+    where, and brings the parts back."""
+    rows = recent_models()
+    if not rows:
+        raise Stop("no model files in %s yet" % ", ".join(MODEL_FOLDERS))
+    path = choose_model("Cut into parts", rows)
+    if not path:
+        return 0
+    choice = menu("How big", [(label, note, SIZE_ICON) for label, note in KIT_SCALES])
+    if not choice:
+        return 0
+    scale = 1.0 if choice == "As made" else float(choice.rstrip("%")) / 100.0
+    notify("Orca", "measuring %s" % os.path.basename(path))
+    found = json.loads(maker_blender(["check", path, "--scale", "%g" % scale, "--json"], timeout=300))
+    tall = found["parts"][0]["size"][2]
+    where = ask_text("Cut %s at (mm up from the plate, commas for several; it is %g mm tall)"
+                     % (os.path.basename(path), tall))
+    heights = [h for h in re.split(r"[,\s]+", where.strip()) if h]
+    if not heights:
+        return 0
+    out_dir = os.path.join(os.path.dirname(path), "kit")
+    if printable_on_plate():
+        cmd_clear(ask=True)                           # a kit wants the plate to itself, and it asks first
+    notify("Orca", "cutting %s into parts" % os.path.basename(path))
+    made = json.loads(maker_blender(["split", path, "--at", ",".join(heights), "--scale", "%g" % scale,
+                                     "--out", out_dir, "--json"]))
+    # One at a time: handed over together, Orca asks whether to load them as one object with several parts,
+    # and a kit wants them as separate objects on the plate anyway.
+    parts = [part["path"] for part in made["parts"]]
+    for part in parts:
+        cmd_import([part], quiet=True)
+        time.sleep(1.0)
+    spread_out(orca_window())                         # every part keeps the place it had in the whole model
+    told = ", ".join("%s %.0f x %.0f x %.0f mm" % (p["name"], p["size"][0], p["size"][1], p["size"][2])
+                     for p in made["parts"])
+    notify("Orca", "%d parts on the plate: %s. They slot together %.0f mm deep; pictures of each are in %s"
+           % (len(parts), told, made.get("overlap", 0), out_dir), seconds=12)
+    return 0
+
+
+def ask_text(prompt):
+    if not shutil.which("omarchy-menu-input", path=ENV.get("PATH")):
+        raise Stop("the Omarchy menu is missing (omarchy-menu-input)")
+    proc = subprocess.run(["omarchy-menu-input", prompt, "--width", "700"], capture_output=True, env=ENV, timeout=900)
+    return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
+
+def ask_file(prompt, folders, formats):
+    if not shutil.which("omarchy-menu-file", path=ENV.get("PATH")):
+        raise Stop("the Omarchy menu is missing (omarchy-menu-file)")
+    found = [os.path.expanduser(f) for f in folders if os.path.isdir(os.path.expanduser(f))]
+    if not found:
+        raise Stop("no picture folders: %s" % ", ".join(folders))
+    proc = subprocess.run(["omarchy-menu-file", prompt, ":".join(found), formats], capture_output=True, env=ENV, timeout=900)
+    return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
+
+SIZES = (("Meshy's size", "its real-world guess, shrunk to fit 180 mm"), ("40 mm tall", None), ("60 mm tall", None),
+         ("80 mm tall", None), ("120 mm tall", None), ("180 mm tall", None))
+
+
+MESHY_LAST = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-maker", "meshy-last.json")
+
+
+def meshy_last(**update):
+    """The last description and height chosen in the Meshy menu (updated with any keywords given)."""
+    try:
+        with open(MESHY_LAST) as handle:
+            last = json.load(handle)
+    except (OSError, ValueError):
+        last = {}
+    if update:
+        last.update(update)
+        os.makedirs(os.path.dirname(MESHY_LAST), exist_ok=True)
+        with open(MESHY_LAST, "w") as handle:
+            json.dump(last, handle)
+    return last
+
+
+def size_rows(last):
+    """The height choices with the one used last on top (the menu's Enter takes the top row)."""
+    return sorted(SIZES, key=lambda row: row[0] != last)
+
+
+def size_args(label):
+    height = re.match(r"^(\d+) mm tall$", label or "")
+    return ["--height", height.group(1)] if height else []
+
+
+def ask_size():
+    """maker-meshy's size options for the chosen height (your last choice first), or None when the menu was closed."""
+    choice = menu("How tall", [(label, sub, SIZE_ICON) for label, sub in size_rows(meshy_last().get("size"))])
+    if not choice:
+        return None
+    meshy_last(size=choice)
+    return size_args(choice)
+
+
+def short_text(text, limit=40):
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0].rstrip(",.;:") + "\u2026"
+
+
+def start_meshy(args):
+    """maker-meshy in the background: it reports through notifications and puts the model on the plate."""
+    tool_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-meshy")
+    logs = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-maker")
+    os.makedirs(logs, exist_ok=True)
+    log = open(os.path.join(logs, "meshy-%s.log" % time.strftime("%Y%m%d-%H%M%S")), "w")
+    subprocess.Popen([tool_path] + args + ["--orca"], env=ENV, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def meshy_pending():
+    """(name, folder) of Meshy jobs cut off before their model was made, from maker-meshy."""
+    tool_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-meshy")
+    proc = subprocess.run([tool_path, "pending"], capture_output=True, text=True, env=ENV, timeout=30)
+    return [tuple(line.split("\t", 1)) for line in proc.stdout.splitlines() if "\t" in line]
+
+
+def meshy_key_present():
+    if os.environ.get("MESHY_API_KEY", "").strip():
+        return True
+    env = os.path.expanduser(os.environ.get("MESHY_ENV_FILE", "~/.config/meshy/env"))
+    try:
+        with open(env) as handle:
+            return bool(re.search(r"^\s*(?:export\s+)?MESHY_API_KEY\s*=\s*['\"]?[^'\"\s]+", handle.read(), re.M))
+    except OSError:
+        return False
+
+
+def cmd_meshy():
+    if not meshy_key_present():
+        raise Stop("no Meshy API key yet: put MESHY_API_KEY=... in ~/.config/meshy/env (chmod 600)")
+    last = meshy_last()
+    options = []
+    if last.get("text"):
+        options.append(("Again: %s" % short_text(last["text"]), "the same words, %s, another try · 20 credits"
+                        % (last.get("size") or "Meshy's size"), WORDS_ICON))
+    pending = meshy_pending()
+    options += [("Finish: %s" % name, "cut off before it was done; Meshy kept it · no new credits", MESHY_ICON) for name, _f in pending]
+    options += [("Describe a model", "Meshy builds it from your words · 20 credits", WORDS_ICON),
+               ("Model from a picture", "a photo or drawing of one object · 20 credits", PICTURE_ICON),
+               ("Model from several views", "2 to 4 pictures of one object, front first · 20 credits", VIEWS_ICON),
+               ("Your Meshy models", "put one on the plate", MODEL_ICON),
+               ("Meshy credits", "how many are left", CREDITS_ICON)]
+    choice = menu("Meshy", options)
+    if choice and choice.startswith("Again: "):
+        start_meshy(["text", last["text"]] + size_args(last.get("size")))
+        notify("Meshy", "building \u201c%s\u201d again: about 2 minutes, it lands on the plate when ready" % short_text(last["text"]))
+        return 0
+    if choice and choice.startswith("Finish: "):
+        folder = dict(("Finish: %s" % name, f) for name, f in pending)[choice]
+        start_meshy(["resume", folder])
+        notify("Meshy", "finishing %s: it lands on the plate when ready" % choice[len("Finish: "):])
+        return 0
+    if choice == "Describe a model":
+        prompt = ask_text("Describe the model")
+        if prompt:
+            meshy_last(text=prompt)
+        size = ask_size() if prompt else None
+        if size is not None:
+            start_meshy(["text", prompt] + size)
+            notify("Meshy", "building \u201c%s\u201d: about 2 minutes, it lands on the plate when ready" % prompt[:60])
+    elif choice == "Model from a picture":
+        picture = ask_file("Picture for Meshy", PICTURE_FOLDERS, "png jpg jpeg")
+        size = ask_size() if picture else None
+        if size is not None:
+            start_meshy(["image", picture] + size)
+            notify("Meshy", "building from %s: about 2 minutes, it lands on the plate when ready" % os.path.basename(picture))
+    elif choice == "Model from several views":
+        views = []
+        while len(views) < 4:
+            picture = ask_file("View %d (%s)" % (len(views) + 1, "front" if not views else "another side"), PICTURE_FOLDERS, "png jpg jpeg")
+            if not picture:
+                break
+            views.append(picture)
+            if len(views) >= 2 and len(views) < 4 and menu("Views", [("Build from %d views" % len(views), None, MESHY_ICON), ("Add another view", None, VIEWS_ICON)]) != "Add another view":
+                break
+        size = ask_size() if views else None
+        if size is not None:
+            start_meshy(["views"] + views + size)
+            notify("Meshy", "building from %d views: about 2 minutes, it lands on the plate when ready" % len(views))
+    elif choice == "Your Meshy models":
+        rows = [(r["model"], r["name"], "%s mm" % " × ".join(str(v) for v in r.get("size_mm") or [])) for r in meshy_models()]
+        if not rows:
+            raise Stop("no Meshy models yet")
+        path = choose_model("Your Meshy models", rows)
+        path = at_height(path) if path else None
+        if path:
+            return cmd_import([path])
+    elif choice == "Meshy credits":
+        tool_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "maker-meshy")
+        out = subprocess.run([tool_path, "credits", "--quiet"], capture_output=True, text=True, env=ENV)
+        notify("Meshy", (out.stdout or out.stderr).strip())
+    return 0
+
+
+def cmd_page(page):
+    if page.isdigit() and 1 <= int(page) <= len(PAGES):
+        page = PAGES[int(page) - 1]
+    if page not in PAGES:
+        raise Stop("unknown page %r (%s)" % (page, ", ".join(PAGES)))
+    win = orca_window()
+    focus(win)
+    go_to_page(win, page)
+    return 0
+
+
+def cmd_dismiss():
+    """Close the pop-up Orca has in front. Esc into the pop-up is what Orca's own windows answer to (checked with a
+    real key on Orca 2.4.2: Preferences, its error boxes); this exists for when Orca's main window holds the focus
+    while a pop-up is still up, which a menu or a click can leave behind, so the key would go to the wrong window.
+    A compositor close request is the last resort: Orca's modal windows ignore it."""
+    dialogs = orca_dialogs()
+    if not dialogs:
+        print("Orca has no pop-up open")
+        return 0
+    front = dialogs[-1]
+    still_there = lambda: [d for d in orca_dialogs() if d["address"] == front["address"]]
+
+    def escape():
+        focus(front)
+        time.sleep(0.3)
+        orca_shortcut(front, "", "Escape")
+
+    def type_escape():
+        focus(front)
+        time.sleep(0.3)
+        run([tool("wtype"), "-k", "Escape"], check=False)
+
+    def close_it():
+        lua('for _, w in ipairs(hl.get_windows()) do if w.address == "%s" then hl.dispatch(hl.dsp.window.close({ window = w })) end end'
+            % front["address"])
+
+    for way in (escape, type_escape, close_it):
+        way()
+        if not wait_for(still_there, 2, step=0.2) or not still_there():
+            return 0
+    raise Stop("Orca is keeping %r open; its own buttons are the way out" % front["title"])
+
+
+def cmd_hint(state="on"):
+    """The Orca keys as one Omarchy note (Ctrl+Alt+H); "off" takes it down."""
+    if state == "off":
+        if shutil.which("omarchy-notification-dismiss", path=ENV.get("PATH")):
+            run(["omarchy-notification-dismiss", "Orca keys"], check=False)
+        return 0
+    if shutil.which("omarchy-notification-send", path=ENV.get("PATH")):
+        if shutil.which("omarchy-notification-dismiss", path=ENV.get("PATH")):
+            run(["omarchy-notification-dismiss", "Orca keys"], check=False)   # one note, not a stack
+        run(["omarchy-notification-send", "-g", "\U000f030c", "-t", "20000", "Orca keys", HINT], check=False)
+    else:
+        print(KEYS)
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    command, args = argv[0], argv[1:]
+    if command == "keys":
+        print(KEYS)
+        return 0
+    if command == "setups":
+        try:
+            return cmd_setups()
+        except Stop as problem:
+            print(problem)
+            return 1
+    if command == "hint":
+        return cmd_hint(args[0] if args else "on")
+    lock = open(os.path.join(ENV["XDG_RUNTIME_DIR"], "maker-orca.lock"), "w")
+    patience = time.time() + (120 if command == "import" else 0)    # a Meshy model may arrive while a menu is open
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= patience:
+                notify("Orca", "still busy with the last key")
+                return 1
+            time.sleep(0.25)
+    home = None
+    try:
+        home = cursor() if command not in ("import", "open", "meshy") else None
+        if command == "page" and args:
+            return cmd_page(args[0])
+        if command == "setup" and args:
+            return cmd_setup(" ".join(args))
+        if command == "menu":
+            return cmd_menu()
+        files = [a for a in args if a not in ("--if-running", "--quiet")]
+        if command == "import" and files:
+            return cmd_import(files, "--if-running" in args, "--quiet" in args)
+        if command == "open":
+            return cmd_open()
+        if command == "print":
+            return cmd_print(" ".join(args) or None)
+        if command == "selfcheck":
+            return cmd_selfcheck()
+        if command == "kit":
+            return cmd_kit()
+        if command == "clear":
+            return cmd_clear("--yes" not in args)
+        if command in ("dismiss", "close"):
+            return cmd_dismiss()
+        if command == "speeds":
+            return cmd_speeds("--revert" in args)
+        if command == "prep":
+            if "--revert" in args:
+                return cmd_prep_revert()
+            infill = int(args[args.index("--infill") + 1]) if "--infill" in args and len(args) > args.index("--infill") + 1 else TEST_INFILL
+            return cmd_prep(infill, "--no-orient" not in args)
+        if command == "plate" and args and args[0] in ("next", "prev"):
+            return cmd_plate(args[0])
+        if command == "meshy":
+            return cmd_meshy()
+        if command == "pick" and args:
+            slot = int(args[args.index("--slot") + 1]) if "--slot" in args else None
+            choose = args[args.index("--choose") + 1] if "--choose" in args else None
+            return cmd_pick(args[0], slot, choose)
+        print(__doc__.strip())
+        return 2
+    except Stop as problem:
+        notify("Orca", str(problem), seconds=6)
+        return 1
+    finally:
+        if home:
+            move_cursor(*home)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,578 @@
+#!/bin/bash
+# maker — slicers that work on Omarchy.
+#
+#   maker doctor                 check the maker setup and say what to fix
+#   maker install orca|bambu|openscad   download the latest official AppImage and set it up
+#   maker update                 update the installed apps to their latest release
+#   maker open FILE...           open models in the right slicer (safe from the drag-and-drop crash), .scad in OpenSCAD
+#   maker default 3mf|model APP  choose which slicer opens .3mf files, or .stl/.step/.obj files
+#   maker bambu single-instance on|off
+#   maker remove orca|bambu|openscad    delete an app installed by maker (its settings stay)
+#   maker printer add NAME URL [--api-key KEY] [--web URL]   show a Klipper printer in the bar
+#   maker printer add-bambu NAME HOST            a Bambu Lab printer (asks for its LAN access code)
+#   maker printer discover | list | remove NAME | test NAME | demo [--stop]
+#   maker keys                   the Orca keys (Control + Alt + one key)
+#   maker meshy text "a stone lantern" | image PICTURE | credits | models   models from Meshy (maker-meshy --help)
+#   maker version
+set -uo pipefail
+
+MAKER_HOME=${MAKER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-maker}
+MAKER_CONFIG=${MAKER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-maker/config}
+SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+BAMBU_CONF=${BAMBU_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/BambuStudio/BambuStudio.conf}
+
+red() { printf '\033[31m%s\033[0m' "$*"; }
+green() { printf '\033[32m%s\033[0m' "$*"; }
+yellow() { printf '\033[33m%s\033[0m' "$*"; }
+die() { echo "maker: $*" >&2; exit 1; }
+
+app_repo() { case "$1" in orca) echo OrcaSlicer/OrcaSlicer ;; bambu) echo bambulab/BambuStudio ;; openscad) echo files.openscad.org ;; *) return 1 ;; esac; }
+app_name() { case "$1" in orca) echo OrcaSlicer ;; bambu) echo "Bambu Studio" ;; openscad) echo OpenSCAD ;; esac; }
+APPS="orca bambu openscad"
+# OpenSCAD: the last release (2021.01, also what pacman's extra repo carries) has no Manifold, so a boolean that takes
+# 0.1 s in a 2025+ build takes minutes there. The project publishes a daily AppImage of the current code instead.
+OPENSCAD_SNAPSHOTS=${OPENSCAD_SNAPSHOTS:-https://files.openscad.org/snapshots/}
+# Which release asset to take. Both projects publish an Ubuntu 24.04 x86_64 AppImage.
+asset_filter() {
+  case "$1" in
+    orca)  echo 'select(.name | test("^OrcaSlicer_Linux_AppImage_Ubuntu2404_V[0-9.]+\\.AppImage$"))' ;;
+    bambu) echo 'select(.name | test("^BambuStudio_ubuntu24\\.04.*\\.AppImage$"))' ;;
+  esac
+}
+check_app() { app_repo "$1" >/dev/null || die "unknown app '$1' (orca, bambu, openscad)"; }
+app_entry() { case "$1" in orca) echo com.orcaslicer.OrcaSlicer.desktop ;; bambu) echo BambuStudio.desktop ;; openscad) echo openscad.desktop ;; esac; }
+
+installed_version() { local link="$MAKER_HOME/apps/$1/current"; [ -L "$link" ] && basename "$(readlink "$link")"; }
+system_binary() {
+  local name
+  case "$1" in orca) name=orca-slicer ;; bambu) name=bambu-studio ;; openscad) name=openscad ;; *) return 1 ;; esac
+  command -v "$name" 2>/dev/null
+}
+
+# The default app a user (or their distro) actually chose for a type, from the mimeapps.list files
+# in lookup order. Empty when nobody chose; GIO then just takes the first launcher listing the type.
+explicit_default() {
+  local f
+  for f in "${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" "${XDG_DATA_HOME:-$HOME/.local/share}/applications/mimeapps.list" \
+           /etc/xdg/mimeapps.list /usr/share/applications/mimeapps.list; do
+    [ -f "$f" ] || continue
+    awk -v t="$1" -F= '/^\[/{sec=$0} sec=="[Default Applications]" && $1==t {sub(/;.*/, "", $2); print $2; found=1; exit} END{exit !found}' "$f" && return 0
+  done
+  return 0
+}
+
+# Running copies of a slicer, found by executable name: the apps rename their main thread
+# (bambustu_main, orcaslicer_main), and other command lines can mention the name.
+app_running() {
+  local p
+  for p in /proc/[0-9]*; do
+    [ "$(basename "$(readlink "$p/exe" 2>/dev/null)")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+config_get() { [ -f "$MAKER_CONFIG" ] && sed -n "s/^$1=//p" "$MAKER_CONFIG" | tail -1; }
+config_set() {
+  mkdir -p "$(dirname "$MAKER_CONFIG")"
+  touch "$MAKER_CONFIG"
+  if grep -q "^$1=" "$MAKER_CONFIG"; then sed -i "s|^$1=.*|$1=$2|" "$MAKER_CONFIG"; else echo "$1=$2" >> "$MAKER_CONFIG"; fi
+}
+
+available() { [ -n "$(installed_version "$1")" ] || system_binary "$1" >/dev/null; }
+
+cmd_install() {
+  local app=${1:-}; [ -n "$app" ] || die "usage: maker install orca|bambu|openscad"
+  check_app "$app"
+  command -v curl >/dev/null || die "curl is missing (sudo pacman -S curl)"
+  command -v jq >/dev/null || die "jq is missing (sudo pacman -S jq)"
+  local repo; repo=$(app_repo "$app")
+  local tag url name size
+  if [ "$app" = openscad ]; then
+    echo "Looking up the newest OpenSCAD build ($OPENSCAD_SNAPSHOTS) ..."
+    name=$(curl -fsSL "$OPENSCAD_SNAPSHOTS" | grep -o 'OpenSCAD-[0-9][0-9.]*-x86_64\.AppImage' | sort -uV | tail -1)
+    [ -n "$name" ] || die "no OpenSCAD x86_64 AppImage listed at $OPENSCAD_SNAPSHOTS"
+    tag=${name#OpenSCAD-}; tag=${tag%-x86_64.AppImage}; url="$OPENSCAD_SNAPSHOTS$name"
+    size=$(curl -fsSLI "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}' | tail -1); size=${size:-0}
+  else
+    echo "Looking up the latest $(app_name "$app") release ..."
+    local release; release=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest") || die "could not reach GitHub"
+    tag=$(jq -r .tag_name <<<"$release")
+    read -r name url size < <(jq -r "[.assets[] | $(asset_filter "$app")][0] | \"\(.name) \(.browser_download_url) \(.size)\"" <<<"$release")
+    [ -n "$url" ] && [ "$url" != null ] || die "no Linux AppImage found in $repo $tag"
+  fi
+  local dest="$MAKER_HOME/apps/$app/$tag"
+  if [ -x "$dest/AppRun" ]; then
+    echo "$(app_name "$app") $tag is already installed."
+  else
+    mkdir -p "$MAKER_HOME/apps/$app" "$MAKER_HOME/cache"
+    local file="$MAKER_HOME/cache/$name"
+    echo "Downloading $name ($((size / 1048576)) MB) ..."
+    curl -fL --progress-bar -o "$file.part" "$url" || die "download failed"
+    mv "$file.part" "$file"
+    chmod +x "$file"
+    # Omarchy has no fuse2, so AppImages cannot mount themselves; unpack instead.
+    local tmp; tmp=$(mktemp -d "$MAKER_HOME/apps/$app/.unpack.XXXXXX")
+    (cd "$tmp" && "$file" --appimage-extract >/dev/null) || { rm -rf "$tmp"; die "could not unpack $name"; }
+    mv "$tmp/squashfs-root" "$dest" && rm -rf "$tmp"
+    rm -f "$file"
+    echo "Unpacked into $dest"
+  fi
+  ln -sfn "$tag" "$MAKER_HOME/apps/$app/current"
+  write_desktop_entry "$app"
+  [ "$app" = bambu ] && bambu_single_instance on quiet
+  [ "$app" = openscad ] && set_mime_default application/x-openscad openscad.desktop
+  echo "$(green "✓") $(app_name "$app") $tag ready. Launch it from the app menu, or: maker open <file>"
+}
+
+# Make an entry the default for a type, remembering what it was so uninstall can put it back.
+set_mime_default() {
+  local t=$1 entry=$2 state="$MAKER_HOME/state" before
+  command -v gio >/dev/null || return 0
+  mkdir -p "$state"
+  if ! grep -q "^$t=" "$state/mime-before" 2>/dev/null; then
+    before=$(explicit_default "$t")
+    echo "$t=$before" >> "$state/mime-before"
+  fi
+  gio mime "$t" "$entry" >/dev/null 2>&1
+}
+
+write_desktop_entry() {
+  local app=$1 template icon target
+  template=$(app_entry "$app")
+  case "$app" in
+    orca)     icon="$MAKER_HOME/apps/orca/current/OrcaSlicer.png" ;;
+    bambu)    icon="$MAKER_HOME/apps/bambu/current/BambuStudio.png" ;;
+    openscad) icon="$MAKER_HOME/apps/openscad/current/openscad-nightly.png" ;;
+  esac
+  # a system package brings its own icon into the icon theme
+  [ -f "$icon" ] || icon=$(basename "$icon" .png)
+  target="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$template"
+  mkdir -p "$(dirname "$target")"
+  sed -e "s|@BIN@|$SRC/bin|g" -e "s|@ICON@|$icon|g" "$SRC/applications/$template" > "$target"
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$(dirname "$target")" 2>/dev/null
+  return 0
+}
+
+cmd_update() {
+  local app any=0
+  for app in $APPS; do
+    [ -n "$(installed_version "$app")" ] || continue
+    any=1; cmd_install "$app"
+  done
+  [ "$any" -eq 1 ] || echo "Nothing installed by maker yet. Try: maker install orca"
+}
+
+cmd_remove() {
+  local app=${1:-}; [ -n "$app" ] || die "usage: maker remove orca|bambu|openscad"
+  check_app "$app"
+  [ -d "$MAKER_HOME/apps/$app" ] || { echo "$(app_name "$app") was not installed by maker."; return 0; }
+  rm -rf "$MAKER_HOME/apps/$app"
+  local entry
+  entry="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$(app_entry "$app")"
+  grep -q '^X-OmarchyMaker=1' "$entry" 2>/dev/null && rm -f "$entry"
+  echo "Removed $(app_name "$app"). Its settings in ~/.config stay where they are."
+}
+
+# The drag-and-drop crash (Bambu Studio #12052) only bites when a file is dragged in. Opening files
+# through the command line or the file manager's "Open With" goes around it, and with Bambu Studio's
+# single-instance setting on, the file lands in the window that is already open.
+bambu_single_instance() {
+  local want=${1:-on} quiet=${2:-}
+  if [ ! -f "$BAMBU_CONF" ]; then
+    [ -n "$quiet" ] || echo "Bambu Studio has not been started yet; open it once, then run: maker bambu single-instance on"
+    return 0
+  fi
+  if app_running bambu-studio; then
+    echo "$(yellow "!") Close Bambu Studio first; it rewrites its settings when it quits. Then: maker bambu single-instance $want"
+    return 1
+  fi
+  local from=false to=true
+  [ "$want" = off ] && { from=true; to=false; }
+  if grep -q "\"single_instance\": $from" "$BAMBU_CONF"; then
+    sed -i "s/\"single_instance\": $from/\"single_instance\": $to/g" "$BAMBU_CONF"
+    echo "Bambu Studio single-instance: $want"
+  else
+    [ -n "$quiet" ] || echo "Bambu Studio single-instance was already $want"
+  fi
+}
+
+ext_of() { local f=${1##*/}; f=${f##*.}; echo "${f,,}"; }
+
+cmd_open() {
+  [ "$#" -gt 0 ] || die "usage: maker open FILE..."
+  local f app threemf model
+  threemf=$(config_get default_3mf); model=$(config_get default_model)
+  declare -A batch=()
+  for f in "$@"; do
+    [ -e "$f" ] || die "no such file: $f"
+    case "$(ext_of "$f")" in
+      3mf) app=${threemf:-} ;;
+      stl|step|stp|obj|amf) app=${model:-} ;;
+      gcode) app=orca ;;
+      scad) app=openscad; available openscad || die "OpenSCAD is not installed (maker install openscad)" ;;
+      *) die "not a model file: $f" ;;
+    esac
+    if [ -z "$app" ] || ! available "$app"; then
+      if available bambu && [ "$(ext_of "$f")" = 3mf ]; then app=bambu
+      elif available orca; then app=orca
+      elif available bambu; then app=bambu
+      else die "no slicer installed. Try: maker install orca"; fi
+    fi
+    batch[$app]+="$(readlink -f "$f")"$'\n'
+  done
+  for app in "${!batch[@]}"; do
+    mapfile -t files < <(printf '%s' "${batch[$app]}")
+    setsid -f "$SRC/bin/maker-run" "$app" "${files[@]}" >/dev/null 2>&1
+    echo "Opening ${#files[@]} file(s) in $(app_name "$app")"
+  done
+}
+
+cmd_default() {
+  local kind=${1:-} app=${2:-}
+  { [ "$kind" = 3mf ] || [ "$kind" = model ]; } && { [ "$app" = orca ] || [ "$app" = bambu ]; } || die "usage: maker default 3mf|model orca|bambu"
+  config_set "default_$kind" "$app"
+  local entry types t
+  entry=$(app_entry "$app")
+  case "$kind" in 3mf) types="model/3mf application/vnd.ms-3mfdocument" ;; model) types="model/stl model/x.stl-ascii model/x.stl-binary model/step model/obj" ;; esac
+  if command -v gio >/dev/null; then
+    local state="$MAKER_HOME/state" before
+    mkdir -p "$state"
+    for t in $types; do
+      # remember what the type opened in before maker touched it, once, so uninstall can put it back
+      if ! grep -q "^$t=" "$state/mime-before" 2>/dev/null; then
+        before=$(explicit_default "$t")
+        echo "$t=$before" >> "$state/mime-before"
+      fi
+      gio mime "$t" "$entry" >/dev/null 2>&1
+    done
+  fi
+  echo "$kind files now open in $(app_name "$app")"
+}
+
+# --- printers ------------------------------------------------------------------------------------
+PRINTERS=${PRINTERS:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-maker/printers.json}
+PLUGIN_ID=layermaker.printers
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
+
+printers_json() { if [ -s "$PRINTERS" ]; then cat "$PRINTERS"; else echo '{"printers":[]}'; fi; }
+
+printers_write() {  # stdin: new JSON. Owner-only, since it can hold API keys.
+  local tmp
+  mkdir -p "$(dirname "$PRINTERS")"
+  tmp=$(umask 077 && mktemp "$PRINTERS.XXXXXX") || die "cannot write $PRINTERS"
+  cat > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$PRINTERS"
+}
+
+normalize_url() {
+  local u=$1
+  [[ $u =~ ^https?:// ]] || u="http://$u"
+  u=${u%/}
+  [[ $u =~ ^https?://[^/?#@[:space:]]+$ ]] || return 1
+  printf '%s' "$u"
+}
+
+plugin_install() {  # copy the widget where the shell looks; the shell refuses symlinked plugins
+  [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy" ] || return 1
+  mkdir -p "$PLUGIN_DIR"
+  local f
+  # copy only what changed: every write makes the shell reload the widget
+  for f in "$SRC/plugins/printers/"*; do
+    cmp -s "$f" "$PLUGIN_DIR/$(basename "$f")" || cp "$f" "$PLUGIN_DIR/"
+  done
+  # drop logic files from older widget versions
+  for f in "$PLUGIN_DIR"/*.js; do
+    [ -e "$f" ] && [ ! -e "$SRC/plugins/printers/$(basename "$f")" ] && rm -f "$f"
+  done
+  shell_ipc && omarchy-shell shell rescanPlugins >/dev/null 2>&1
+  return 0
+}
+
+# Talk to the running Omarchy shell only for real installs (tests set MAKER_NO_SHELL=1).
+shell_ipc() { [ -z "${MAKER_NO_SHELL:-}" ] && command -v omarchy-shell >/dev/null; }
+
+plugin_enabled() { grep -q "\"$PLUGIN_ID\"" "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json" 2>/dev/null; }
+
+cmd_printer() {
+  local sub=${1:-list}; shift || true
+  case "$sub" in
+    add)
+      local name=${1:-} url=${2:-} key="" web=""
+      [ -n "$name" ] && [ -n "$url" ] || die "usage: maker printer add NAME URL [--api-key KEY] [--web URL]"
+      shift 2
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --api-key) key=${2:-}; shift ;;
+          --web) web=$(normalize_url "${2:-}") || die "bad --web URL: ${2:-}"; shift ;;
+          *) die "unknown option: $1" ;;
+        esac
+        shift
+      done
+      url=$(normalize_url "$url") || die "use a plain address like http://voron.local:7125 (no path, no user:password)"
+      printers_json | jq --arg n "$name" --arg u "$url" --arg k "$key" --arg w "$web" \
+        '.printers = ([.printers[]? | select(.name != $n)] + [{name: $n, type: "moonraker", url: $u} + (if $k != "" then {apiKey: $k} else {} end) + (if $w != "" then {webUrl: $w} else {} end)])' \
+        | printers_write
+      echo "Added $name ($url)"
+      if curl -fsS -m 5 ${key:+-H "X-Api-Key: $key"} "$url/printer/info" >/dev/null 2>&1; then echo "$(green "✓") Moonraker answers at $url"
+      else echo "$(yellow "!") No answer from $url/printer/info yet; the widget will keep trying"; fi
+      if plugin_install; then
+        if ! plugin_enabled && shell_ipc && command -v omarchy >/dev/null; then
+          omarchy plugin enable "$PLUGIN_ID" --section right >/dev/null 2>&1 && echo "Printers widget added to the bar"
+        fi
+      fi
+      ;;
+    add-bambu)
+      local name=${1:-} host=${2:-} code=${BAMBU_ACCESS_CODE:-} cert serial fp out
+      [ -n "$name" ] && [ -n "$host" ] || die "usage: maker printer add-bambu NAME HOST   (the access code is on the printer screen)"
+      [[ $host =~ ^[A-Za-z0-9.:-]+$ ]] || die "HOST should be the printer's address, like 192.168.1.50"
+      cert=$("$SRC/bin/maker-bambu" cert "$host") || die "no Bambu printer answers at $host:8883 (is it on and on this network?)"
+      serial=$(jq -r .serial <<<"$cert"); fp=$(jq -r .fingerprint <<<"$cert")
+      echo "Found printer $serial at $host"
+      if [ -z "$code" ]; then
+        [ -t 0 ] || die "set BAMBU_ACCESS_CODE or run this in a terminal to be asked for the code"
+        read -rs -p "LAN access code (8 characters, from the printer screen): " code; echo
+      fi
+      [ -n "$code" ] || die "no access code given"
+      out=$(BAMBU_HOST=$host BAMBU_SERIAL=$serial BAMBU_ACCESS_CODE=$code BAMBU_FINGERPRINT=$fp "$SRC/bin/maker-bambu" check 2>&1)
+      case $? in
+        0) ;;
+        3) die "the printer refused that access code (it changes when LAN Only Mode is switched)" ;;
+        *) die "could not read the printer: $out" ;;
+      esac
+      printers_json | jq --arg n "$name" --arg h "$host" --arg s "$serial" --arg f "$fp" --arg c "$code" \
+        '.printers = ([.printers[]? | select(.name != $n)] + [{name: $n, type: "bambu", host: $h, serial: $s, fingerprint: $f, accessCode: $c}])' \
+        | printers_write
+      echo "$(green "✓") $name: $(jq -r '.state + (if .filename != "" then " · " + .filename else "" end)' <<<"$out")"
+      if plugin_install; then
+        if ! plugin_enabled && shell_ipc && command -v omarchy >/dev/null; then
+          omarchy plugin enable "$PLUGIN_ID" --section right >/dev/null 2>&1 && echo "Printers widget added to the bar"
+        fi
+      fi
+      ;;
+    discover)
+      echo "Listening for Bambu Lab printers for 12 seconds ..."
+      local found
+      found=$("$SRC/bin/maker-bambu" discover 12)
+      if [ -z "$found" ]; then
+        echo "None heard. Printers announce themselves on UDP port 2021; a firewall (ufw) can hide them. Add one by address: maker printer add-bambu NAME HOST"
+      else
+        jq -r '"\(.name)\t\(.host)\t\(.model)\t\(.mode)"' <<<"$found" | column -t -s $'\t'
+        echo "Add one with: maker printer add-bambu NAME HOST"
+      fi
+      ;;
+    list)
+      printers_json | jq -r '.printers[]? | "\(.name)\t\(if .type == "bambu" then "bambu \(.host)" else .url end)\(if .apiKey then "\t(API key set)" else "" end)"' | column -t -s $'\t'
+      [ "$(printers_json | jq '.printers | length')" -gt 0 ] || echo "No printers yet: maker printer add NAME URL"
+      ;;
+    remove)
+      local name=${1:-}; [ -n "$name" ] || die "usage: maker printer remove NAME"
+      printers_json | jq -e --arg n "$name" 'any(.printers[]?; .name == $n)' >/dev/null || die "no printer named $name"
+      printers_json | jq --arg n "$name" '.printers = [.printers[]? | select(.name != $n)]' | printers_write
+      echo "Removed $name"
+      ;;
+    test)
+      local name=${1:-} entry url key
+      [ -n "$name" ] || die "usage: maker printer test NAME"
+      entry=$(printers_json | jq -c --arg n "$name" '.printers[]? | select(.name == $n)')
+      [ -n "$entry" ] || die "no printer named $name"
+      if [ "$(jq -r '.type // "moonraker"' <<<"$entry")" = bambu ]; then
+        local st
+        st=$(BAMBU_HOST=$(jq -r .host <<<"$entry") BAMBU_SERIAL=$(jq -r .serial <<<"$entry") \
+             BAMBU_ACCESS_CODE=$(jq -r .accessCode <<<"$entry") BAMBU_FINGERPRINT=$(jq -r .fingerprint <<<"$entry") \
+             "$SRC/bin/maker-bambu" check) || die "could not read $name"
+        jq -r '"State: \(.state)" + (if .filename != "" then "\nFile: \(.filename)\nProgress: \((.progress * 100) | floor)%" else "" end) + "\nNozzle: \(.extruder // "?")°  Bed: \(.bed // "?")°"' <<<"$st"
+        return 0
+      fi
+      url=$(jq -r .url <<<"$entry"); key=$(jq -r '.apiKey // ""' <<<"$entry")
+      local out
+      out=$(curl -fsS -m 5 ${key:+-H "X-Api-Key: $key"} "$url/printer/objects/query?print_stats&display_status&webhooks") || die "no answer from $url"
+      jq -r '.result.status | "Klipper: \(.webhooks.state)\nState: \(.print_stats.state)\(if .print_stats.filename != "" then "\nFile: \(.print_stats.filename)\nProgress: \((.display_status.progress * 100) | floor)%" else "" end)"' <<<"$out"
+      ;;
+    demo)
+      # a simulated Klipper printer on this machine, to see the widget without a printer
+      local port=7199 pidfile="$MAKER_HOME/state/demo-printer.pid"
+      if [ "${1:-}" = --stop ]; then
+        [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"
+        printers_json | jq '.printers = [.printers[]? | select(.name != "Demo printer")]' | printers_write
+        echo "Demo printer stopped and removed"
+        return 0
+      fi
+      command -v python3 >/dev/null || die "the demo needs python3"
+      mkdir -p "$MAKER_HOME/state"
+      if ! { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }; then
+        setsid -f python3 "$SRC/tests/mock-moonraker.py" --port "$port" --name Demo --loop "${1:-900}" >/dev/null 2>&1
+        sleep 1
+        pgrep -f "mock-moonraker.py --port $port" | head -1 > "$pidfile"
+      fi
+      cmd_printer add "Demo printer" "http://127.0.0.1:$port"
+      curl -fs -X POST "http://127.0.0.1:$port/mock/start?file=demo/benchy_0.2mm_PLA.gcode&seconds=${1:-900}" >/dev/null
+      echo "A simulated print is running. Stop the demo with: maker printer demo --stop"
+      ;;
+    *) die "usage: maker printer add|add-bambu|discover|list|remove|test|demo" ;;
+  esac
+}
+
+row() { printf '  %s %s\n' "$1" "$2"; }
+
+cmd_doctor() {
+  local bad=0 warns=0 app v
+  ok()   { row "$(green "✓")" "$*"; }
+  warn() { row "$(yellow "!")" "$*"; warns=$((warns + 1)); }
+  fail() { row "$(red "✗")" "$*"; bad=$((bad + 1)); }
+  info() { row "i" "$*"; }
+
+  echo "omarchy-maker $(cat "$SRC/VERSION" 2>/dev/null || echo dev) doctor"
+  echo "System"
+  if [ -r "${OMARCHY_PATH:-/usr/share/omarchy}/version" ]; then
+    v=$(omarchy version 2>/dev/null || cat "${OMARCHY_PATH:-/usr/share/omarchy}/version")
+    case "$v" in 4.*) ok "Omarchy $v" ;; *) warn "Omarchy $v (built and tested on Omarchy 4)" ;; esac
+  else
+    warn "not Omarchy (the Hyprland rule and menu entries will not apply)"
+  fi
+  for v in curl jq gio; do command -v "$v" >/dev/null && ok "$v" || fail "$v missing"; done
+  [ -r /etc/ssl/certs/ca-certificates.crt ] && ok "CA bundle at /etc/ssl/certs/ca-certificates.crt" || warn "no CA bundle at /etc/ssl/certs/ca-certificates.crt; the slicers will ask about certificates"
+
+  echo "Slicers"
+  for app in orca bambu; do
+    v=$(installed_version "$app")
+    if [ -n "$v" ]; then ok "$(app_name "$app") $v (maker)"
+    elif system_binary "$app" >/dev/null; then ok "$(app_name "$app") from $(system_binary "$app") (system)"
+    else warn "$(app_name "$app") not installed (maker install $app)"; fi
+    local entry; entry=$(app_entry "$app")
+    if available "$app"; then
+      if grep -q '^X-OmarchyMaker=1' "${XDG_DATA_HOME:-$HOME/.local/share}/applications/$entry" 2>/dev/null; then ok "$(app_name "$app") launcher applies the fixes"
+      else warn "$(app_name "$app") launcher is the stock one (maker install $app rewrites it)"; fi
+    fi
+  done
+  if available bambu; then
+    if [ ! -f "$BAMBU_CONF" ]; then warn "Bambu Studio never started; open it once, then: maker bambu single-instance on"
+    elif grep -q '"single_instance": true' "$BAMBU_CONF"; then ok "Bambu Studio single-instance on (Open With lands in the open window)"
+    else warn "Bambu Studio single-instance off (maker bambu single-instance on)"; fi
+  fi
+
+  echo "Design"
+  if command -v blender >/dev/null 2>&1; then
+    ok "Blender $(blender --version 2>/dev/null | head -1 | cut -d' ' -f2) (its Preferences, Render and File View windows float; workspace 9)"
+  else
+    info "no Blender (sudo pacman -S blender): Ctrl+Alt+K cuts models into parts through it"
+  fi
+  v=$(installed_version openscad)
+  if [ -n "$v" ]; then
+    ok "OpenSCAD $v (maker; workspace 8)"
+    local scad_out; scad_out=$(mktemp -u "${TMPDIR:-/tmp}/maker-scad-XXXXXX.stl")
+    if printf 'difference(){cube(10,center=true);sphere(d=11);}\n' | timeout 60 "$MAKER_HOME/apps/openscad/current/AppRun" --backend=manifold -o "$scad_out" - >/dev/null 2>&1 && [ -s "$scad_out" ]; then
+      ok "OpenSCAD renders with Manifold"
+    else warn "OpenSCAD could not render a test model (maker install openscad again)"; fi
+    rm -f "$scad_out"
+    grep -q '^X-OmarchyMaker=1' "${XDG_DATA_HOME:-$HOME/.local/share}/applications/openscad.desktop" 2>/dev/null && ok "OpenSCAD launcher applies the fixes (XWayland, scaled)" || warn "OpenSCAD launcher missing (maker install openscad)"
+  elif system_binary openscad >/dev/null; then
+    warn "OpenSCAD from $(system_binary openscad) is the 2021 release without Manifold: maker install openscad gets the current build"
+  else
+    info "no OpenSCAD (maker install openscad): parametric parts and connectors"
+  fi
+
+  # the printer camera in Orca/Bambu Studio plays H.264 through GStreamer; Omarchy ships only gst-plugins-base
+  if available orca || available bambu; then
+    if command -v gst-inspect-1.0 >/dev/null && gst-inspect-1.0 avdec_h264 >/dev/null 2>&1 && gst-inspect-1.0 h264parse >/dev/null 2>&1; then
+      ok "H.264 video for the printer camera view"
+    else
+      warn "printer camera view needs H.264 codecs: omarchy pkg add gst-libav gst-plugins-good gst-plugins-bad (then restart the slicer)"
+    fi
+  fi
+
+  echo "Hyprland"
+  local hypr="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+  [ -f "$hypr/maker.lua" ] && ok "window rules in $hypr/maker.lua" || fail "window rules missing (run install.sh)"
+  grep -q 'require("hypr.maker")' "$hypr/hyprland.lua" 2>/dev/null && ok "hypr.maker required from hyprland.lua" || fail "hyprland.lua does not require hypr.maker (run install.sh)"
+  if available bambu; then
+    info "Dragging a file into Bambu Studio crashes it while the clipboard holds something (Hyprland discussion 11179). Use Open With or maker open instead"
+  fi
+
+  if available orca; then
+    echo "Orca keys (Control + Alt + one key)"
+    grep -q 'o.bind("CTRL + ALT + O"' "$hypr/maker.lua" 2>/dev/null && ok "Orca keys in $hypr/maker.lua" || warn "Orca keys missing (run install.sh)"
+    [ -x "$HOME/.local/bin/maker-orca" ] && ok "maker-orca" || warn "maker-orca not linked (run install.sh)"
+    if [ -x "$MAKER_HOME/bin/wlrctl" ] && grep -aq 'wheel needs NOTCHES' "$MAKER_HOME/bin/wlrctl"; then ok "wlrctl with the wheel action"
+    else warn "wlrctl with the wheel action missing: the Orca keys for pages and presets need it (run install.sh; needs base-devel)"; fi
+    command -v grim >/dev/null && ok "grim" || warn "grim missing (sudo pacman -S grim)"
+    if command -v tesseract >/dev/null && tesseract --list-langs 2>/dev/null | grep -qx eng; then ok "Tesseract with English"
+    else warn "Tesseract with English missing: sudo pacman -S tesseract tesseract-data-eng"; fi
+
+    if pgrep -f 'orca-slicer|OrcaSlicer' >/dev/null 2>&1; then
+      # captured first, not piped: grep -q stops reading early and pipefail would count busctl's SIGPIPE as a failure
+      local bus_names; bus_names=$(XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} busctl --user list --no-legend 2>/dev/null)
+      local bus_name; bus_name=$(grep -o '^com\.orcaslicer\.OrcaSlicer\.InstanceCheck\.Object[0-9]*' <<<"$bus_names" | head -1)
+      # the name alone is not enough: an Orca started while another copy was up keeps the name but never listens
+      if [ -n "$bus_name" ] && XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} timeout 6 busctl --user introspect "$bus_name" "/${bus_name//.//}" >/dev/null 2>&1; then
+        ok "the running Orca takes models from outside (Ctrl+Alt+I and Ctrl+Alt+M put them on the plate)"
+      elif [ -n "$bus_name" ]; then warn "Orca has the D-Bus name but does not answer: it was started more than once; restart Orca (Ctrl+Alt+I and Ctrl+Alt+M can't put models on its plate)"
+      else warn "the running Orca does not listen for models on D-Bus: Ctrl+Alt+I and Ctrl+Alt+M can't put models on its plate"; fi
+    else
+      info "start OrcaSlicer to check that it takes models from outside (Ctrl+Alt+I and Ctrl+Alt+M)"
+    fi
+
+    echo "Parts (Ctrl+Alt+K in Orca)"
+    [ -x "$HOME/.local/bin/maker-blender" ] && ok "maker-blender" || warn "maker-blender not linked (run install.sh)"
+    if command -v blender >/dev/null 2>&1; then
+      ok "Blender $(blender --version 2>/dev/null | head -1 | cut -d' ' -f2)"
+    else
+      info "no Blender: Ctrl+Alt+K cuts models into parts through it (sudo pacman -S blender)"
+    fi
+
+    echo "Meshy (Ctrl+Alt+M in Orca)"
+    [ -x "$HOME/.local/bin/maker-meshy" ] && ok "maker-meshy" || warn "maker-meshy not linked (run install.sh)"
+    local meshy_env=${MESHY_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/meshy/env}
+    if [ -n "${MESHY_API_KEY:-}" ]; then
+      ok "Meshy API key in MESHY_API_KEY"
+    elif grep -qE '^[[:space:]]*(export[[:space:]]+)?MESHY_API_KEY=.' "$meshy_env" 2>/dev/null; then
+      ok "Meshy API key in $meshy_env"
+      [ "$(stat -c %a "$meshy_env")" = 600 ] && ok "$meshy_env readable only by you" || warn "$meshy_env should be mode 600 (chmod 600 $meshy_env)"
+    else
+      info "no Meshy API key yet: put MESHY_API_KEY=... in $meshy_env (chmod 600), from meshy.ai > API"
+    fi
+  fi
+
+  echo "Printers"
+  local count; count=$(printers_json | jq '.printers | length' 2>/dev/null || echo 0)
+  if [ "$count" -eq 0 ]; then info "no printers yet (maker printer add NAME URL)"
+  else
+    ok "$count printer(s) in $PRINTERS"
+    [ -f "$PLUGIN_DIR/manifest.json" ] && ok "Printers widget installed" || warn "Printers widget not installed (maker printer add installs it)"
+    plugin_enabled && ok "Printers widget in the bar" || warn "Printers widget not in the bar (omarchy plugin enable $PLUGIN_ID)"
+    [ "$(stat -c %a "$PRINTERS" 2>/dev/null)" = 600 ] && ok "printers.json readable only by you" || warn "printers.json should be mode 600 (chmod 600 $PRINTERS)"
+  fi
+
+  echo "File types"
+  if command -v gio >/dev/null; then
+    for t in model/3mf model/stl; do
+      v=$(explicit_default "$t")
+      case "$v" in
+        BambuStudio.desktop|com.orcaslicer.OrcaSlicer.desktop) ok "$t opens in ${v%.desktop}" ;;
+        "") warn "$t has no default app (maker default ${t#model/} orca|bambu)" ;;
+        *) warn "$t opens in ${v%.desktop} (maker default $( [ "$t" = model/3mf ] && echo 3mf || echo model) orca|bambu)" ;;
+      esac
+    done
+  fi
+  echo
+  echo "$bad red, $warns yellow"
+  [ "$bad" -eq 0 ]
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  update) shift; cmd_update ;;
+  open) shift; cmd_open "$@" ;;
+  default) shift; cmd_default "$@" ;;
+  bambu) shift; [ "${1:-}" = single-instance ] || die "usage: maker bambu single-instance on|off"; bambu_single_instance "${2:-on}" ;;
+  remove) shift; cmd_remove "$@" ;;
+  printer|printers) shift; cmd_printer "$@" ;;
+  plugin-install) plugin_install ;;
+  has) shift; check_app "${1:-}"; available "$1" ;;
+  entry) shift; check_app "${1:-}"; write_desktop_entry "$1" ;;
+  explicit-default) shift; explicit_default "${1:?type}" ;;
+  keys) "$SRC/bin/maker-orca" keys ;;
+  meshy) shift; exec "$SRC/bin/maker-meshy" "$@" ;;
+  version|--version) cat "$SRC/VERSION" 2>/dev/null || echo dev ;;
+  ""|-h|--help|help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
+  *) die "unknown command '$1' (maker help)" ;;
+esac

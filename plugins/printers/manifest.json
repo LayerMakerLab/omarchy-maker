@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "layermaker.printers",
+  "name": "Printers",
+  "version": "0.3.0",
+  "author": "omarchy-maker",
+  "license": "MIT",
+  "description": "Your 3D printers in the bar: the running print, time left, temperatures, and a notification when it finishes or fails. Klipper (Moonraker) and Bambu Lab printers on your network.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Printers",
+    "description": "The running print and time left in the bar; every printer in the panel. Add printers with: maker printer add (Klipper) or maker printer add-bambu (Bambu Lab)",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "notifyOnFinish": true,
+      "notifyOnError": true,
+      "finishHoldMin": 10
+    },
+    "schema": [
+      { "key": "notifyOnFinish", "type": "boolean", "label": "Notify when a print finishes", "defaultValue": true },
+      { "key": "notifyOnError", "type": "boolean", "label": "Notify when a print fails or is cancelled", "defaultValue": true },
+      { "key": "finishHoldMin", "type": "integer", "label": "Keep a finished print lit (minutes)", "min": 0, "max": 120, "step": 5, "defaultValue": 10, "description": "How long the bar keeps showing a finished print. Opening the panel clears it." }
+    ]
+  }
+}

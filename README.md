@@ -30,7 +30,7 @@ two keys.
 ![OrcaSlicer with the Orca keys note](docs/screenshots/01-orca-keys.png)
 
 Everything here was built and checked on a real Omarchy 4.0.3 machine and is covered by tests
-(81 unit tests, a 72-check install-use-uninstall smoke run, and a live self-check against Orca).
+(89 unit tests, a 72-check install-use-uninstall smoke run, and a live self-check against Orca).
 
 ## What it fixes
 
@@ -189,6 +189,11 @@ sliced with another printer preset (Orca refuses to send an A1 a plate sliced fo
 that setup, slices again and then picks the printer. For Bambu printers added with `maker printer add-bambu` a fresh camera photo of the plate comes
 with the notification. **Send stays yours**: check the plate and press Send in Orca's window.
 `maker-orca print P1S` does the same from a terminal.
+
+The print window's last two switches and its Send button have no keys in Orca either, so `maker-orca send
+--timelapse on --bed-leveling on` sets them and presses Send for you, then waits for the window to go. The
+Device page's printer controls are in the menu too: **Home the printer**, **Bed up 10 mm**, **Bed down 10 mm**
+(`maker-orca printer home|up MM|down MM`); they read the axis labels off the screen and press Orca's own buttons.
 
 If models stop landing on the plate, Orca was probably started twice: the second copy keeps the D-Bus
 name but never listens, so `maker doctor` says to restart Orca. Orca's own **Allow only one OrcaSlicer

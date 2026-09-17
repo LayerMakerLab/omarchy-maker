@@ -20,6 +20,10 @@ settings that the choice took.
     maker-orca prep --revert     put those four settings back to what the preset says (Orca's undo does not)
     maker-orca speeds            a touch off every printing speed, a little more off the bridges, and a touch
                                  back onto the overhangs (--revert puts them back; nothing is saved to a preset)
+    maker-orca printer home      the Device page's printer controls: home the axes
+    maker-orca printer up 10     the bed up (toward the nozzle) or down that many millimetres
+    maker-orca send [--timelapse on|off] [--bed-leveling on|off]
+                                 in the open print window: set the two switches, press Send, wait for the printer
     maker-orca dismiss           close the pop-up Orca has in front (Esc does this itself; the Esc binding calls it
                                  when Orca's main window holds the focus while a pop-up is still up)
     maker-orca clear [--yes]     take everything off every plate (Orca's Ctrl+Z puts it back)
@@ -1259,6 +1263,9 @@ def cmd_menu():
                 ("Make a model with Meshy...", "describe it, or give it pictures", MESHY_ICON),
                 ("Prepare for a test print", "lay it down, 10% infill, no brim, supports only if Orca asks", PREP_ICON),
                 ("Slow the speeds a touch", "bridges slower still, overhangs a touch quicker", PREP_ICON),
+                ("Home the printer", "Device page: the printer homes its axes", ACTION_ICON),
+                ("Bed up 10 mm", "Device page: the bed toward the nozzle", ACTION_ICON),
+                ("Bed down 10 mm", "Device page: the bed away from the nozzle", ACTION_ICON),
                 ("Cut a model into parts...", "parts that slot together and each print flat (Blender)", KIT_ICON),
                 ("Clear the plate", "take everything off it (Ctrl+Z in Orca puts it back)", KIT_ICON),
                 ("Check the Orca keys", "a live check on an empty plate: pages, a model, slicing, the print window", CHECK)]
@@ -1291,6 +1298,10 @@ def cmd_menu():
         return cmd_meshy()
     if choice == "Prepare for a test print":
         return cmd_prep()
+    if choice == "Home the printer":
+        return cmd_printer("home")
+    if choice in ("Bed up 10 mm", "Bed down 10 mm"):
+        return cmd_printer(choice.split()[1], 10)
     if choice == "Slow the speeds a touch":
         return cmd_speeds()
     if choice == "Cut a model into parts...":
@@ -3104,6 +3115,164 @@ def cmd_page(page):
     return 0
 
 
+# --------------------------------------------------------------------------------------- send
+# The print window's last row: "Timelapse  [On|Off]   Auto Bed Leveling  [On|Off]" and the Send button. The
+# switches are two labels in a pill; the chosen side has a thin Orca-green line a few rows under its label
+# (the pill itself is grey on both sides), so the rows under each label are scanned for green. Orca gives none of this a key.
+GREEN_MARGIN = 40
+ON_LEFT_OF_OFF = 44                             # the On label sits this far left of Off in the pill
+
+
+def switch_labels(words, label):
+    """(on_word, off_word) for the switch that follows `label` on its row, or None when the row is not read."""
+    anchors = [w for w in words if w["text"].strip().lower().startswith(label.lower())]
+    if not anchors:
+        return None
+    anchor = anchors[0]
+    mid = anchor["y"] + anchor["h"] / 2.0
+    row = sorted((w for w in words if w["x"] > anchor["x"] and abs(w["y"] + w["h"] / 2.0 - mid) <= max(8, anchor["h"] * 0.7)),
+                 key=lambda w: w["x"])
+    on = next((w for w in row if w["text"].strip().lower() in ("on", "0n")), None)
+    off = next((w for w in row if w["text"].strip().lower() in ("off", "0ff", "of")), None)
+    if off and not on:                          # "On" is two white letters on green; Tesseract usually drops it
+        on = dict(off, text="On", x=off["x"] - ON_LEFT_OF_OFF, w=16)
+    return (on, off) if on and off else None
+
+
+def switch_is_on(shot, on, off):
+    def green(word):                            # the chosen side carries a thin Orca-green line a few rows under its label
+        x = word["x"] + word["w"] / 2.0
+        return max(g - r for r, g, b in (shot.pixel(x, word["y"] + word["h"] + below) for below in range(2, 16)))
+    return green(on) > green(off) + GREEN_MARGIN if abs(green(on) - green(off)) > GREEN_MARGIN else None
+
+
+def cmd_send(timelapse=None, bed_leveling=None):
+    """In Orca's open print window: set Timelapse and Auto Bed Leveling as asked, press Send, wait for the window."""
+    dialog = send_dialog()
+    if not dialog:
+        raise Stop("Orca's print window is not open; press the print key first")
+    focus(dialog)
+    time.sleep(0.3)
+    shot = Shot(dialog, 0, 0, dialog["size"][0], dialog["size"][1])
+    words = shot.words(psm=11)
+    seen = {(w["text"], int(w["x"]), int(w["y"])) for w in words}
+    words += [w for w in shot.words(psm=6) if (w["text"], int(w["x"]), int(w["y"])) not in seen]
+    changed = []
+    for label, wanted in (("Timelapse", timelapse), ("Leveling", bed_leveling)):
+        if wanted is None:
+            continue
+        pair = switch_labels(words, label)
+        if not pair:
+            raise Stop("can't see the %s switch in the print window" % label.lower())
+        on, off = pair
+        state = switch_is_on(shot, on, off)
+        if state is None:
+            raise Stop("can't tell which side of the %s switch is on" % label.lower())
+        if state != (wanted == "on"):
+            target = on if wanted == "on" else off
+            click(dialog, target["x"] + target["w"] / 2.0, target["y"] + target["h"] / 2.0)
+            time.sleep(0.4)
+            changed.append("%s %s" % (label.lower(), wanted))
+    if changed:                                            # read again: the pill has to show the new side
+        shot = Shot(dialog, 0, 0, dialog["size"][0], dialog["size"][1])
+        words = shot.words(psm=11)
+        for label, wanted in (("Timelapse", timelapse), ("Leveling", bed_leveling)):
+            pair = switch_labels(words, label) if wanted is not None else None
+            if pair and switch_is_on(shot, *pair) != (wanted == "on"):
+                raise Stop("the %s switch did not take %s" % (label.lower(), wanted))
+    send = next((w for w in words if w["text"].strip().lower() == "send"), None)
+    if not send:
+        raise Stop("can't see the Send button")
+    click(dialog, send["x"] + send["w"] / 2.0, send["y"] + send["h"] / 2.0)
+    notify("Orca", "Send pressed%s" % ((": " + ", ".join(changed)) if changed else ""))
+    gone = wait_for(lambda: not send_dialog(), 90, step=0.5)
+    if not gone:
+        titles = [d.get("title") for d in orca_dialogs()]
+        raise Stop("the print window is still open after Send (%s); look at Orca" % ", ".join(map(str, titles)))
+    notify("Orca", "sent; the printer takes it from here")
+    return 0
+
+
+# ----------------------------------------------------------------------------------- printer controls
+# The Device page's Control panel has buttons Orca gives no keys to: the axis pad with the home button in
+# its middle, and under it a row of bed buttons, "^10 ^1 Bed v1 v10". The "Bed" label is too dim for
+# Tesseract, but the axis labels ("-X", "X", "Y", "-Y") and the "10" on the two outer bed buttons come
+# through (as "10", "T10", "110" or "L110"), and every button sits at a fixed offset from those
+# (Orca 2.4.2, 1440 x 900, one pixel per point): the up buttons 92 and 38 points left of the row's middle,
+# the down buttons 39 and 93 right of it.
+BED_UP_X = {10: -92, 1: -38}
+BED_DOWN_X = {1: 39, 10: 93}
+BED_ROW_BELOW_MINUS_Y = (30, 130)              # the bed row lies this far under the "-Y" label
+TEN_BUTTON = re.compile(r"^[A-Za-z1|]{0,2}10$")   # what the arrow-plus-"10" buttons come back as
+
+
+def controls_from_words(words):
+    """{'home': (x, y), 'bed': (x, y)} from the words of the Control panel, in window coordinates."""
+    def centre(w):
+        return (w["x"] + w["w"] / 2.0, w["y"] + w["h"] / 2.0)
+
+    def find(*texts):
+        hits = [w for w in words if w["text"].replace("\u2212", "-").strip() in texts]
+        return hits[0] if hits else None
+    minus_x, plus_x = find("-X", "-x"), find("X", "x")
+    minus_y, plus_y = find("-Y", "-y"), find("Y", "y")
+    row_y = minus_x or plus_x
+    column_x = minus_y or plus_y
+    if not row_y or not column_x:
+        raise Stop("can't see the printer controls on the Device page (is a printer selected and online?)")
+    home = (centre(column_x)[0], centre(row_y)[1])
+    anchor_y = centre(minus_y)[1] if minus_y else centre(row_y)[1] + 82
+    tens = [w for w in words if TEN_BUTTON.match(w["text"].strip())
+            and BED_ROW_BELOW_MINUS_Y[0] <= centre(w)[1] - anchor_y <= BED_ROW_BELOW_MINUS_Y[1]]
+    if len(tens) >= 2:
+        tens.sort(key=lambda w: centre(w)[0])
+        left, right = centre(tens[0]), centre(tens[-1])
+        bed = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
+    else:
+        bed = (home[0] - 2, home[1] + 147)      # measured: the row's middle sits 147 points under the home button
+    return {"home": home, "bed": bed}
+
+
+def device_controls(win):
+    half = win["size"][0] // 2
+    shot = Shot(win, half, 60, win["size"][0] - half, min(520, win["size"][1] - 60))
+    words = shot.words(psm=11)
+    seen = {(w["text"], int(w["x"]), int(w["y"])) for w in words}
+    words += [w for w in shot.words(psm=6) if (w["text"], int(w["x"]), int(w["y"])) not in seen]   # each pass misses some labels
+    return controls_from_words(words)
+
+
+def cmd_printer(action, amount=None):
+    """Home the printer, or move its bed up or down by whole millimetres, with the Device page's own buttons."""
+    if action not in ("home", "up", "down"):
+        raise Stop("printer what? home, up MM, or down MM")
+    mm = 10
+    if action != "home":
+        try:
+            mm = int(amount or 10)
+        except ValueError:
+            raise Stop("bed up/down wants a whole number of millimetres")
+        if not 1 <= mm <= 250:
+            raise Stop("bed up/down wants 1 to 250 mm")
+    win = orca_window()
+    focus(win)
+    go_to_page(win, "device")
+    time.sleep(0.8)
+    spots = device_controls(win)
+    if action == "home":
+        click(win, *spots["home"])
+        notify("Orca", "homing the printer")
+        return 0
+    steps = BED_UP_X if action == "up" else BED_DOWN_X
+    bx, by = spots["bed"]
+    for step, count in ((10, mm // 10), (1, mm % 10)):
+        for _ in range(count):
+            click(win, bx + steps[step], by)
+            time.sleep(0.35)
+    notify("Orca", "bed %s %d mm" % (action, mm))
+    return 0
+
+
 def cmd_dismiss():
     """Close the pop-up Orca has in front. Esc into the pop-up is what Orca's own windows answer to (checked with a
     real key on Orca 2.4.2: Preferences, its error boxes); this exists for when Orca's main window holds the focus
@@ -3214,6 +3383,14 @@ def main(argv):
             return cmd_plate(args[0])
         if command == "meshy":
             return cmd_meshy()
+        if command == "printer" and args:
+            return cmd_printer(args[0], args[1] if len(args) > 1 else None)
+        if command == "send":
+            def flag(name):
+                if name in args and len(args) > args.index(name) + 1 and args[args.index(name) + 1] in ("on", "off"):
+                    return args[args.index(name) + 1]
+                return None
+            return cmd_send(flag("--timelapse"), flag("--bed-leveling"))
         if command == "pick" and args:
             slot = int(args[args.index("--slot") + 1]) if "--slot" in args else None
             choose = args[args.index("--choose") + 1] if "--choose" in args else None

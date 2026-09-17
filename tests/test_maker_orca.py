@@ -483,3 +483,67 @@ class ThePlateMenu(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrinterControls(unittest.TestCase):
+    """The Device page's home and bed buttons are found from what Tesseract reads there (Orca 2.4.2, 1440 x 900,
+    the words below are the real ones from 2026-09-17: "Bed" itself never comes through)."""
+
+    def words(self, *items):
+        return [{"text": t, "x": x, "y": y, "w": w, "h": h, "conf": 90} for t, x, y, w, h in items]
+
+    REAL = (("-X", 1080, 264, 18, 14), ("X", 1245, 264, 11, 14), ("Y", 1164, 183, 12, 14), ("-Y", 1162, 346, 17, 14),
+            ("T10", 1058, 410, 32, 14), ("Ta", 1114, 410, 20, 14), ("To", 1191, 410, 20, 14), ("110", 1243, 410, 28, 14))
+
+    def test_home_is_the_middle_of_the_axis_pad(self):
+        spots = orca.controls_from_words(self.words(*self.REAL))
+        self.assertAlmostEqual(spots["home"][0], 1170, delta=2)      # the column of the Y labels
+        self.assertAlmostEqual(spots["home"][1], 271, delta=1)       # the row of the X labels
+
+    def test_bed_row_is_centred_between_the_two_10_buttons(self):
+        spots = orca.controls_from_words(self.words(*self.REAL))
+        self.assertAlmostEqual(spots["bed"][0], (1074 + 1257) / 2.0, delta=1)
+        self.assertAlmostEqual(spots["bed"][1], 417, delta=1)
+
+    def test_bed_row_falls_back_to_the_home_button_when_the_10s_are_missing(self):
+        spots = orca.controls_from_words(self.words(*self.REAL[:4]))
+        self.assertAlmostEqual(spots["bed"][1], spots["home"][1] + 147)
+
+    def test_no_axis_labels_means_no_controls(self):
+        with self.assertRaises(orca.Stop):
+            orca.controls_from_words(self.words(("Camera", 300, 100, 60, 14), ("T10", 1058, 410, 32, 14)))
+
+
+class SendSwitches(unittest.TestCase):
+    """The print window's Timelapse and Auto Bed Leveling switches: each is an On and an Off label on the row
+    that starts with its name (words as Tesseract returned them on 2026-09-17)."""
+
+    ROW = [{"text": "Timelapse", "x": 16, "y": 548, "w": 60, "h": 14}, {"text": "On", "x": 266, "y": 548, "w": 16, "h": 14},
+           {"text": "Off", "x": 310, "y": 548, "w": 18, "h": 14}, {"text": "Auto", "x": 356, "y": 548, "w": 28, "h": 14},
+           {"text": "Bed", "x": 390, "y": 548, "w": 24, "h": 14}, {"text": "Leveling", "x": 420, "y": 548, "w": 48, "h": 14},
+           {"text": "On", "x": 606, "y": 548, "w": 16, "h": 14}, {"text": "Off", "x": 650, "y": 548, "w": 18, "h": 14},
+           {"text": "Send", "x": 606, "y": 608, "w": 34, "h": 14}]
+
+    def test_each_switch_takes_the_first_on_and_off_after_its_label(self):
+        on, off = orca.switch_labels(self.ROW, "Timelapse")
+        self.assertEqual((on["x"], off["x"]), (266, 310))
+        on, off = orca.switch_labels(self.ROW, "Leveling")
+        self.assertEqual((on["x"], off["x"]), (606, 650))
+
+    def test_on_is_placed_from_off_when_tesseract_drops_it(self):
+        row = [w for w in self.ROW if w["text"] != "On"]
+        on, off = orca.switch_labels(row, "Timelapse")
+        self.assertEqual(on["x"], 310 - orca.ON_LEFT_OF_OFF)
+        self.assertEqual(off["x"], 310)
+
+    def test_a_missing_row_is_none(self):
+        self.assertIsNone(orca.switch_labels(self.ROW[:1], "Timelapse"))
+        self.assertIsNone(orca.switch_labels(self.ROW, "Flow"))
+
+    def test_the_green_side_is_the_one_that_is_on(self):
+        class Pixels:
+            def pixel(self, x, y):              # green under On (x 266-282), gray under Off, dark on the text row
+                return (1, 103, 91) if x < 300 and 565 <= y <= 567 else (76, 76, 85)   # a thin line, like Orca's
+        on, off = orca.switch_labels(self.ROW, "Timelapse")
+        self.assertTrue(orca.switch_is_on(Pixels(), on, off))
+        self.assertFalse(orca.switch_is_on(Pixels(), off, on))
